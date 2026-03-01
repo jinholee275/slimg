@@ -69,6 +69,9 @@ bun run dev
 
 ```bash
 bun run tauri dev
+
+# 윈도우
+$env:CMAKE_GENERATOR = "Visual Studio 17 2022"; bun run tauri dev
 ```
 
 `tauri.conf.json`에서 개발 전 프론트 명령으로 `bun run dev`를 사용하도록 설정되어 있습니다.
