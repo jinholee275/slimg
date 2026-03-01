@@ -822,8 +822,32 @@ fn guess_mime_from_path(path: &Path) -> &'static str {
 
 fn build_display_data_url(path: &Path) -> Option<String> {
     let bytes = fs::read(path).ok()?;
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    // WebView2(Chromium) DOES NOT support TIFF/BMP natively.
+    // Convert them to PNG for display preview.
+    if matches!(ext.as_str(), "tif" | "tiff" | "bmp") {
+        if let Ok(img) = image::load_from_memory(&bytes) {
+            // Thumbnail for preview performance
+            let preview = img.thumbnail(1200, 1200);
+            let mut buffer = Cursor::new(Vec::new());
+            if preview.write_to(&mut buffer, image::ImageFormat::Png).is_ok() {
+                let encoded = BASE64_STANDARD.encode(buffer.into_inner());
+                return Some(format!("data:image/png;base64,{}", encoded));
+            }
+        }
+    }
+
     let encoded = BASE64_STANDARD.encode(bytes);
-    Some(format!("data:{};base64,{}", guess_mime_from_path(path), encoded))
+    Some(format!(
+        "data:{};base64,{}",
+        guess_mime_from_path(path),
+        encoded
+    ))
 }
 
 fn compute_ncc_similarity(a: &image::GrayImage, b: &image::GrayImage) -> f32 {
