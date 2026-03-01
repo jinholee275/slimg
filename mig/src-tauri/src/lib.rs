@@ -1,13 +1,17 @@
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use bytes::Bytes;
+use dssim::Dssim;
 use exif::{In, Tag, Value};
 use image::{GenericImageView, ImageReader};
 use image::imageops::FilterType;
+use img_hash::image::GrayImage as HashGrayImage;
+use img_hash::{HashAlg, HasherConfig};
 use img_parts::ImageEXIF;
 use little_exif::exif_tag::ExifTag as LittleExifTag;
 use little_exif::metadata::Metadata as LittleExifMetadata;
 use little_exif::rational::uR64 as LittleExifUR64;
+use rgb::FromSlice;
 use serde::Deserialize;
 use serde::Serialize;
 use slimg_core::{
@@ -160,6 +164,12 @@ struct OptimizationCriteria {
 struct MigrationOptions {
     restore_metadata: bool,
     acceleration_mode: AccelerationMode,
+}
+
+#[derive(Clone, Copy)]
+struct OptimizationPlan {
+    scale: f32,
+    apply_target_dpi: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -847,69 +857,86 @@ fn compute_ncc_similarity(a: &image::GrayImage, b: &image::GrayImage) -> f32 {
     ((ncc + 1.0) * 0.5).clamp(0.0, 1.0)
 }
 
-fn transformed_image(source: &image::DynamicImage, transform: &str) -> image::DynamicImage {
-    match transform {
-        "rot90" => source.rotate90(),
-        "rot180" => source.rotate180(),
-        "rot270" => source.rotate270(),
-        "flip_h" => source.fliph(),
-        "flip_v" => source.flipv(),
-        "rot90_flip_h" => source.rotate90().fliph(),
-        "rot90_flip_v" => source.rotate90().flipv(),
-        _ => source.clone(),
+fn compute_hash_similarity(a: &image::DynamicImage, b: &image::DynamicImage) -> f32 {
+    let hasher = HasherConfig::new()
+        .hash_alg(HashAlg::Gradient)
+        .hash_size(8, 8)
+        .to_hasher();
+
+    let a_luma = a.to_luma8();
+    let b_luma = b.to_luma8();
+    let a_hash_img = match HashGrayImage::from_raw(a_luma.width(), a_luma.height(), a_luma.into_raw()) {
+        Some(img) => img,
+        None => return 0.0,
+    };
+    let b_hash_img = match HashGrayImage::from_raw(b_luma.width(), b_luma.height(), b_luma.into_raw()) {
+        Some(img) => img,
+        None => return 0.0,
+    };
+
+    let ah = hasher.hash_image(&a_hash_img);
+    let bh = hasher.hash_image(&b_hash_img);
+    let bit_len = (ah.as_bytes().len() * 8) as f32;
+    if bit_len <= 0.0 {
+        return 0.0;
     }
+    let dist = ah.dist(&bh) as f32;
+    (1.0 - (dist / bit_len)).clamp(0.0, 1.0)
+}
+
+fn compute_dssim_similarity(a: &image::DynamicImage, b: &image::DynamicImage) -> Option<f32> {
+    let dssim = Dssim::new();
+    let a_rgba = a.to_rgba8();
+    let b_rgba = b.to_rgba8();
+    let (w, h) = a_rgba.dimensions();
+    if b_rgba.dimensions() != (w, h) || w == 0 || h == 0 {
+        return None;
+    }
+
+    let a_pixels = a_rgba.as_raw().as_rgba();
+    let b_pixels = b_rgba.as_raw().as_rgba();
+    let a_img = dssim.create_image_rgba(a_pixels, w as usize, h as usize)?;
+    let b_img = dssim.create_image_rgba(b_pixels, w as usize, h as usize)?;
+    let (dssim_value, _) = dssim.compare(&a_img, b_img);
+    let dssim_scalar: f64 = dssim_value.into();
+    let similarity = (1.0_f64 / (1.0_f64 + dssim_scalar.max(0.0))) as f32;
+    Some(similarity.clamp(0.0, 1.0))
 }
 
 fn verify_image_pair_sync(source_path: String, dest_path: String) -> Result<ImageVerificationResult, String> {
-    let source = load_image_with_fallback(Path::new(&source_path))
+    let source_raw = load_image_with_fallback(Path::new(&source_path))
         .map_err(|e| format!("원본 이미지 로드 실패: {}", e))?;
-    let dest = load_image_with_fallback(Path::new(&dest_path))
+    let dest_raw = load_image_with_fallback(Path::new(&dest_path))
         .map_err(|e| format!("대상 이미지 로드 실패: {}", e))?;
 
+    // 검증은 표시 기준과 동일하게 EXIF Orientation을 정규화한 픽셀 기준으로 수행
+    let source_orientation = read_exif_orientation(Path::new(&source_path));
+    let dest_orientation = read_exif_orientation(Path::new(&dest_path));
+    let source = normalize_dynamic_image_orientation(source_raw, source_orientation);
+    let dest = normalize_dynamic_image_orientation(dest_raw, dest_orientation);
+
+    // 비율/스케일 역시 정규화된 픽셀 기준으로 판정
+    let (sw, sh) = source.dimensions();
     let (dw, dh) = dest.dimensions();
+
     if dw == 0 || dh == 0 {
         return Err("대상 이미지 해상도가 유효하지 않습니다.".to_string());
     }
-
-    let transforms = [
-        "identity",
-        "rot90",
-        "rot180",
-        "rot270",
-        "flip_h",
-        "flip_v",
-        "rot90_flip_h",
-        "rot90_flip_v",
-    ];
-
-    let mut best_transform = "identity";
-    let mut best_score = -1.0_f32;
-    let mut best_sw = 0_u32;
-    let mut best_sh = 0_u32;
-
-    let dest_luma = dest.resize_exact(256, 256, FilterType::Triangle).to_luma8();
-
-    for t in transforms {
-        let ts = transformed_image(&source, t);
-        let (sw, sh) = ts.dimensions();
-        if sw == 0 || sh == 0 {
-            continue;
-        }
-        let source_luma = ts.resize_exact(256, 256, FilterType::Triangle).to_luma8();
-        let score = compute_ncc_similarity(&source_luma, &dest_luma);
-        if score > best_score {
-            best_score = score;
-            best_transform = t;
-            best_sw = sw;
-            best_sh = sh;
-        }
-    }
-
-    if best_sw == 0 || best_sh == 0 {
+    if sw == 0 || sh == 0 {
         return Err("원본 이미지 해상도가 유효하지 않습니다.".to_string());
     }
 
-    let source_ar = best_sw as f32 / best_sh as f32;
+    const HASH_EARLY_PASS: f32 = 0.985;
+    const HASH_EARLY_FAIL: f32 = 0.70;
+
+    let best_transform = "identity";
+    let dest_small = dest.resize_exact(256, 256, FilterType::Triangle);
+    let dest_luma = dest_small.to_luma8();
+    let source_small = source.resize_exact(256, 256, FilterType::Triangle);
+    let source_luma = source_small.to_luma8();
+    let hash_score = compute_hash_similarity(&source_small, &dest_small);
+
+    let source_ar = sw as f32 / sh as f32;
     let dest_ar = dw as f32 / dh as f32;
     let aspect_ratio_delta = if source_ar > f32::EPSILON {
         ((dest_ar - source_ar).abs() / source_ar).clamp(0.0, 10.0)
@@ -917,35 +944,71 @@ fn verify_image_pair_sync(source_path: String, dest_path: String) -> Result<Imag
         1.0
     };
 
-    let sx = dw as f32 / best_sw as f32;
-    let sy = dh as f32 / best_sh as f32;
+    let sx = dw as f32 / sw as f32;
+    let sy = dh as f32 / sh as f32;
     let scale_ratio_delta = if sx.max(sy) > f32::EPSILON {
         ((sx - sy).abs() / sx.max(sy)).clamp(0.0, 10.0)
     } else {
         1.0
     };
 
-    let orientation_issue = best_transform != "identity";
+    let orientation_issue = false;
     let aspect_issue = aspect_ratio_delta > 0.02 || scale_ratio_delta > 0.02;
+    let ncc_score = compute_ncc_similarity(&source_luma, &dest_luma);
 
-    let verdict = if orientation_issue || aspect_issue || best_score < 0.90 {
+    let (best_score, _best_dssim, message) = if aspect_issue {
+        (
+            (hash_score * 0.6 + ncc_score * 0.4).clamp(0.0, 1.0),
+            ncc_score,
+            "실패: 비율 왜곡 또는 비정상 리사이즈 가능성이 있습니다.".to_string(),
+        )
+    } else if hash_score >= HASH_EARLY_PASS {
+        (
+            hash_score,
+            hash_score,
+            format!(
+                "검증 통과(빠른 판정): 해시 유사도 {:.1}%로 매우 높아 조기 종료했습니다.",
+                hash_score * 100.0
+            ),
+        )
+    } else if hash_score <= HASH_EARLY_FAIL {
+        (
+            hash_score,
+            hash_score,
+            format!(
+                "실패(빠른 판정): 해시 유사도 {:.1}%로 매우 낮아 조기 종료했습니다.",
+                hash_score * 100.0
+            ),
+        )
+    } else {
+        let dssim_score = compute_dssim_similarity(&source_small, &dest_small).unwrap_or(ncc_score);
+        let combined = (hash_score * 0.35) + (dssim_score * 0.45) + (ncc_score * 0.20);
+        let verdict_preview = if combined < 0.88 {
+            "실패"
+        } else if combined < 0.94 {
+            "주의"
+        } else {
+            "검증 통과"
+        };
+        (
+            combined,
+            dssim_score,
+            format!(
+                "{}: 유사도 {:.1}% (해시 {:.1}%, 구조 {:.1}%)",
+                verdict_preview,
+                combined * 100.0,
+                hash_score * 100.0,
+                dssim_score * 100.0
+            ),
+        )
+    };
+
+    let verdict = if orientation_issue || aspect_issue || best_score < 0.88 {
         "fail"
-    } else if best_score < 0.95 {
+    } else if best_score < 0.94 {
         "warn"
     } else {
         "pass"
-    };
-
-    let message = if verdict == "pass" {
-        "검증 통과: 원본 대비 유사도가 높고 기하 변형 징후가 없습니다."
-    } else if verdict == "warn" {
-        "주의: 유사도가 다소 낮습니다. 육안 확인이 필요합니다."
-    } else if orientation_issue {
-        "실패: 회전/뒤집힘 가능성이 높습니다."
-    } else if aspect_issue {
-        "실패: 비율 왜곡 또는 비정상 리사이즈 가능성이 있습니다."
-    } else {
-        "실패: 원본 대비 유사도가 낮습니다."
     };
 
     Ok(ImageVerificationResult {
@@ -956,11 +1019,11 @@ fn verify_image_pair_sync(source_path: String, dest_path: String) -> Result<Imag
         aspect_issue,
         aspect_ratio_delta,
         scale_ratio_delta,
-        source_width: best_sw,
-        source_height: best_sh,
+        source_width: sw,
+        source_height: sh,
         dest_width: dw,
         dest_height: dh,
-        message: message.to_string(),
+        message,
     })
 }
 
@@ -1022,16 +1085,28 @@ fn get_image_details_sync(path: String) -> Result<ImageDetails, String> {
     })
 }
 
-fn compute_required_scale(file: &MigrationTaskFile, criteria: OptimizationCriteria) -> Option<f32> {
+fn compute_required_scale(file: &MigrationTaskFile, criteria: OptimizationCriteria) -> Option<OptimizationPlan> {
     let mut required_scales: Vec<f32> = Vec::new();
+    let mut apply_target_dpi = false;
 
     if criteria.use_dpi {
-        if let (Some(x), Some(y)) = (file.dpi_x, file.dpi_y) {
-            if x > criteria.target_dpi || y > criteria.target_dpi {
-                let sx = criteria.target_dpi / x;
-                let sy = criteria.target_dpi / y;
-                required_scales.push(sx.min(sy));
-            }
+        let dpi_candidates = [file.dpi_x, file.dpi_y];
+        let dpi_exceeded = dpi_candidates
+            .iter()
+            .flatten()
+            .any(|dpi| *dpi > criteria.target_dpi);
+
+        if dpi_exceeded {
+            apply_target_dpi = true;
+            let sx = file.dpi_x.map(|x| criteria.target_dpi / x);
+            let sy = file.dpi_y.map(|y| criteria.target_dpi / y);
+            let dpi_scale = match (sx, sy) {
+                (Some(x), Some(y)) => x.min(y),
+                (Some(x), None) => x,
+                (None, Some(y)) => y,
+                (None, None) => 1.0,
+            };
+            required_scales.push(dpi_scale);
         }
     }
 
@@ -1063,7 +1138,10 @@ fn compute_required_scale(file: &MigrationTaskFile, criteria: OptimizationCriter
     if scale >= 1.0 {
         None
     } else {
-        Some(scale)
+        Some(OptimizationPlan {
+            scale,
+            apply_target_dpi,
+        })
     }
 }
 
@@ -1116,12 +1194,27 @@ fn copy_metadata_best_effort(
     set_target_dpi: Option<u32>,
 ) -> String {
     let detected = detect_real_image_format(source_path);
+    let mut metadata = match LittleExifMetadata::new_from_path(source_path) {
+        Ok(v) => v,
+        Err(e) => return format!("메타데이터 복원 일부 실패: 원본 EXIF 읽기 실패 ({})", e),
+    };
 
-    let orientation = read_exif_orientation(source_path);
-    if orientation != Some(1) && orientation.is_some() {
-        return "메타데이터 복원 생략(Orientation 정규화 우선)".to_string();
+    // 본문 픽셀은 방향 정규화해서 저장하므로 EXIF Orientation도 1로 맞춘다.
+    metadata.set_tag(LittleExifTag::Orientation(vec![1]));
+
+    // DPI 기준 최적화 활성 시, 대상 DPI를 명시적으로 고정 저장한다.
+    if let Some(target_dpi) = set_target_dpi {
+        let r = LittleExifUR64::from(target_dpi);
+        metadata.set_tag(LittleExifTag::XResolution(vec![r.clone()]));
+        metadata.set_tag(LittleExifTag::YResolution(vec![r]));
+        metadata.set_tag(LittleExifTag::ResolutionUnit(vec![2]));
     }
 
+    if metadata.write_to_file(dest_path).is_ok() {
+        return "메타데이터 복원 완료".to_string();
+    }
+
+    // little_exif 실패 시 JPEG/PNG/WebP는 기존 EXIF 복사 방식으로 폴백
     let source_bytes = match fs::read(source_path) {
         Ok(v) => v,
         Err(e) => return format!("메타데이터 복원 실패(원본 읽기): {}", e),
@@ -1131,7 +1224,7 @@ fn copy_metadata_best_effort(
         Err(e) => return format!("메타데이터 복원 실패(대상 읽기): {}", e),
     };
 
-    let result = match detected {
+    let fallback_result = match detected {
         Some(RealImageFormat::Jpeg) => {
             let src = img_parts::jpeg::Jpeg::from_bytes(Bytes::from(source_bytes));
             let dst = img_parts::jpeg::Jpeg::from_bytes(Bytes::from(dest_bytes));
@@ -1180,37 +1273,13 @@ fn copy_metadata_best_effort(
                 (Err(e), _) | (_, Err(e)) => Err(e.to_string()),
             }
         }
-        Some(RealImageFormat::Tiff) => {
-            let mut metadata = match LittleExifMetadata::new_from_path(source_path) {
-                Ok(v) => v,
-                Err(e) => return format!("메타데이터 복원 일부 실패: {}", e),
-            };
-
-            metadata.set_tag(LittleExifTag::Orientation(vec![1]));
-
-            if let Some(target_dpi) = set_target_dpi {
-                let r = LittleExifUR64::from(target_dpi);
-                metadata.set_tag(LittleExifTag::XResolution(vec![r.clone()]));
-                metadata.set_tag(LittleExifTag::YResolution(vec![r]));
-                metadata.set_tag(LittleExifTag::ResolutionUnit(vec![2]));
-            }
-
-            metadata
-                .write_to_file(dest_path)
-                .map_err(|e| e.to_string())
-        }
-        _ => return "메타데이터 복원 생략(포맷 미지원)".to_string(),
+        _ => Err("메타데이터 복원 생략(포맷 미지원)".to_string()),
     };
 
-    match result {
-        Ok(_) => "메타데이터 복원 완료".to_string(),
-        Err(e) => {
-            if e.is_empty() {
-                "메타데이터 복원 일부 실패".to_string()
-            } else {
-                format!("메타데이터 복원 일부 실패: {}", e)
-            }
-        }
+    match fallback_result {
+        Ok(_) => "메타데이터 복원 완료(폴백)".to_string(),
+        Err(e) if e.is_empty() => "메타데이터 복원 일부 실패".to_string(),
+        Err(e) => format!("메타데이터 복원 일부 실패: {}", e),
     }
 }
 
@@ -1261,7 +1330,7 @@ fn should_use_gpu_in_auto_mode(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -
 
 fn run_slimg_resize_with_cancel(
     file: &MigrationTaskFile,
-    scale: f32,
+    plan: OptimizationPlan,
     cancel_flag: &AtomicBool,
     criteria: OptimizationCriteria,
     migration_options: MigrationOptions,
@@ -1291,8 +1360,8 @@ fn run_slimg_resize_with_cancel(
         }
 
         let oriented = normalize_dynamic_image_orientation(image, file.orientation);
-        let new_w = ((oriented.width() as f32) * scale).round().max(1.0) as u32;
-        let new_h = ((oriented.height() as f32) * scale).round().max(1.0) as u32;
+        let new_w = ((oriented.width() as f32) * plan.scale).round().max(1.0) as u32;
+        let new_h = ((oriented.height() as f32) * plan.scale).round().max(1.0) as u32;
         let resized = oriented.resize_exact(new_w, new_h, FilterType::Lanczos3);
 
         let output = if matches!(real_format, Some(RealImageFormat::Tiff)) {
@@ -1310,7 +1379,7 @@ fn run_slimg_resize_with_cancel(
         }
 
         let metadata_message = if migration_options.restore_metadata {
-            copy_metadata_best_effort(&file.source_path, &file.dest_path, if criteria.use_dpi {
+            copy_metadata_best_effort(&file.source_path, &file.dest_path, if plan.apply_target_dpi {
                 Some(criteria.target_dpi as u32)
             } else {
                 None
@@ -1318,13 +1387,41 @@ fn run_slimg_resize_with_cancel(
         } else {
             "메타데이터 복원 비활성화".to_string()
         };
+        let optimized_size_bytes = fs::metadata(&file.dest_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if optimized_size_bytes > source_size_bytes {
+            if let Err(e) = fs::copy(&file.source_path, &file.dest_path) {
+                return ProcessOutcome::Failed(format!(
+                    "원본 복원 실패(최적화 결과가 더 큼): {} -> {} ({})",
+                    file.source_path.display(),
+                    file.dest_path.display(),
+                    e
+                ));
+            }
+            let restored_size_bytes = fs::metadata(&file.dest_path)
+                .map(|m| m.len())
+                .unwrap_or(source_size_bytes);
+            return ProcessOutcome::Success(ProcessSuccess {
+                action: "skipped",
+                source_size_bytes,
+                dest_size_bytes: restored_size_bytes,
+                message: format!(
+                    "{} 최적화 결과가 원본보다 커서 원본으로 복원 후 스킵 처리",
+                    if matches!(real_format, Some(RealImageFormat::Tiff)) {
+                        "TIFF"
+                    } else {
+                        "BMP"
+                    }
+                ),
+                fallback_code: None,
+            });
+        }
 
         return ProcessOutcome::Success(ProcessSuccess {
             action: "optimized",
             source_size_bytes,
-            dest_size_bytes: fs::metadata(&file.dest_path)
-                .map(|m| m.len())
-                .unwrap_or(0),
+            dest_size_bytes: optimized_size_bytes,
             message: format!("{} 최적화 완료(방향 정규화 적용) / {}",
               if matches!(real_format, Some(RealImageFormat::Tiff)) { "TIFF" } else { "BMP" },
               metadata_message),
@@ -1332,6 +1429,9 @@ fn run_slimg_resize_with_cancel(
         });
     }
 
+    let source_size_bytes = fs::metadata(&file.source_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
     let (decoded, decoded_format) = match decode_file(&file.source_path) {
         Ok(value) => value,
         Err(e) => {
@@ -1369,8 +1469,8 @@ fn run_slimg_resize_with_cancel(
         fill_color: None,
     };
 
-    let new_w = ((normalized.width as f32) * scale).round().max(1.0) as u32;
-    let new_h = ((normalized.height as f32) * scale).round().max(1.0) as u32;
+    let new_w = ((normalized.width as f32) * plan.scale).round().max(1.0) as u32;
+    let new_h = ((normalized.height as f32) * plan.scale).round().max(1.0) as u32;
     let effective_mode = match migration_options.acceleration_mode {
         AccelerationMode::Cpu => AccelerationMode::Cpu,
         AccelerationMode::GpuPreferred => AccelerationMode::GpuPreferred,
@@ -1387,7 +1487,7 @@ fn run_slimg_resize_with_cancel(
 
     let (preprocessed, accel_note, accel_fallback_code) = match effective_mode {
         AccelerationMode::Cpu => {
-            match slimg_resize(&normalized, &ResizeMode::Scale(scale as f64)) {
+            match slimg_resize(&normalized, &ResizeMode::Scale(plan.scale as f64)) {
                 Ok(img) => {
                     let note = if matches!(migration_options.acceleration_mode, AccelerationMode::Auto) {
                         "가속: Auto->CPU".to_string()
@@ -1405,7 +1505,7 @@ fn run_slimg_resize_with_cancel(
                     (normalized.clone(), note, None)
                 }
             }
-        }
+        },
         _ => match panic::catch_unwind(AssertUnwindSafe(|| {
             gpu_resize_rgba_wgpu(&normalized.data, normalized.width, normalized.height, new_w, new_h)
         })) {
@@ -1420,7 +1520,7 @@ fn run_slimg_resize_with_cancel(
             ),
             Ok(Err(e)) => {
                 let resized =
-                    slimg_resize(&normalized, &ResizeMode::Scale(scale as f64)).unwrap_or_else(|_| normalized.clone());
+                    slimg_resize(&normalized, &ResizeMode::Scale(plan.scale as f64)).unwrap_or_else(|_| normalized.clone());
                 (
                     resized,
                     if matches!(migration_options.acceleration_mode, AccelerationMode::Auto) {
@@ -1433,7 +1533,7 @@ fn run_slimg_resize_with_cancel(
             }
             Err(_) => {
                 let resized =
-                    slimg_resize(&normalized, &ResizeMode::Scale(scale as f64)).unwrap_or_else(|_| normalized.clone());
+                    slimg_resize(&normalized, &ResizeMode::Scale(plan.scale as f64)).unwrap_or_else(|_| normalized.clone());
                 (
                     resized,
                     if matches!(migration_options.acceleration_mode, AccelerationMode::Auto) {
@@ -1468,12 +1568,35 @@ fn run_slimg_resize_with_cancel(
             e
         ));
     }
+    let optimized_size_bytes = fs::metadata(&file.dest_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    if optimized_size_bytes > source_size_bytes {
+        if let Err(e) = fs::copy(&file.source_path, &file.dest_path) {
+            return ProcessOutcome::Failed(format!(
+                "원본 복원 실패(최적화 결과가 더 큼): {} -> {} ({})",
+                file.source_path.display(),
+                file.dest_path.display(),
+                e
+            ));
+        }
+        let restored_size_bytes = fs::metadata(&file.dest_path)
+            .map(|m| m.len())
+            .unwrap_or(source_size_bytes);
+        return ProcessOutcome::Success(ProcessSuccess {
+            action: "skipped",
+            source_size_bytes,
+            dest_size_bytes: restored_size_bytes,
+            message: "최적화 결과가 원본보다 커서 원본으로 복원 후 스킵 처리".to_string(),
+            fallback_code: None,
+        });
+    }
 
     let metadata_message = if migration_options.restore_metadata {
         copy_metadata_best_effort(
             &file.source_path,
             &file.dest_path,
-            if criteria.use_dpi {
+            if plan.apply_target_dpi {
                 Some(criteria.target_dpi as u32)
             } else {
                 None
@@ -1485,12 +1608,8 @@ fn run_slimg_resize_with_cancel(
 
     ProcessOutcome::Success(ProcessSuccess {
         action: "optimized",
-        source_size_bytes: fs::metadata(&file.source_path)
-            .map(|m| m.len())
-            .unwrap_or(0),
-        dest_size_bytes: fs::metadata(&file.dest_path)
-            .map(|m| m.len())
-            .unwrap_or(0),
+        source_size_bytes,
+        dest_size_bytes: optimized_size_bytes,
         message: format!("최적화 완료(방향 정규화 적용) / {} / {}", metadata_message, accel_note),
         fallback_code: accel_fallback_code,
     })
@@ -1534,8 +1653,8 @@ fn process_single_migration_file(
 
     let source_size_bytes = fs::metadata(&file.source_path).map(|m| m.len()).unwrap_or(0);
 
-    if let Some(scale) = compute_required_scale(file, criteria) {
-        return run_slimg_resize_with_cancel(file, scale, cancel_flag, criteria, options);
+    if let Some(plan) = compute_required_scale(file, criteria) {
+        return run_slimg_resize_with_cancel(file, plan, cancel_flag, criteria, options);
     }
 
     if cancel_flag.load(Ordering::Relaxed) {

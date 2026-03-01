@@ -219,8 +219,6 @@ let verificationActiveLoads = 0;
 let verificationQueue: FileItem[] = [];
 const verificationQueuedKeys = new Set<string>();
 const verificationLoadingKeys = new Set<string>();
-let verificationQueueRafId: number | null = null;
-let verificationQueueNeedsCancel = false;
 const VERIFY_CONCURRENCY = 1;
 let scrollIdleTimer: number | null = null;
 const SCROLL_IDLE_MS = 90;
@@ -424,7 +422,6 @@ function pumpDestDetailsQueue(version: number, epoch: number) {
         destActiveLoads -= 1;
         if (version === destLoadVersion && epoch === destRequestEpoch) {
           pumpDestDetailsQueue(version, epoch);
-          scheduleVerificationVisibleQueue(false);
         }
       }
     })();
@@ -681,7 +678,6 @@ function scheduleQueuesOnScrollIdle() {
     scrollIdleTimer = null;
     scheduleVisibleQueue(false);
     scheduleDestVisibleQueue(false);
-    scheduleVerificationVisibleQueue(false);
   }, SCROLL_IDLE_MS);
 }
 
@@ -695,7 +691,6 @@ function updateViewportMetrics() {
   contentScrollTop.value = Math.max(0, el.scrollTop - contentTop);
   scheduleVisibleQueue(true);
   scheduleDestVisibleQueue(true);
-  scheduleVerificationVisibleQueue(true);
 }
 
 function resetFailedNavigation() {
@@ -723,6 +718,7 @@ function toggleStatusFilter(status: 'pending' | 'skipped' | 'optimized' | 'faile
 
 function enqueueItemVerification(file: FileItem) {
   const key = file.relativePath;
+  if (migrationResultFor(key)?.status !== 'optimized') return;
   if (itemVerificationMap.value[key] || verificationQueuedKeys.has(key) || verificationLoadingKeys.has(key)) return;
   verificationQueuedKeys.add(key);
   verificationQueue.push(file);
@@ -737,6 +733,11 @@ function pumpItemVerificationQueue(epoch: number) {
   while (verificationActiveLoads < VERIFY_CONCURRENCY && verificationQueue.length > 0) {
     const file = verificationQueue.shift()!;
     const key = file.relativePath;
+    if (migrationResultFor(key)?.status !== 'optimized') {
+      delete itemVerificationMap.value[key];
+      verificationQueuedKeys.delete(key);
+      continue;
+    }
     const destAbsolutePath = toDestAbsolutePath(file);
 
     verificationQueuedKeys.delete(key);
@@ -746,14 +747,6 @@ function pumpItemVerificationQueue(epoch: number) {
     void (async () => {
       try {
         if (!destAbsolutePath) {
-          if (epoch === verificationEpoch) {
-            delete itemVerificationMap.value[key];
-          }
-          return;
-        }
-
-        const destDetails = destDetailsMap.value[key];
-        if (!destDetails || destDetails.loading || !!destDetails.error) {
           if (epoch === verificationEpoch) {
             delete itemVerificationMap.value[key];
           }
@@ -791,63 +784,25 @@ function pumpItemVerificationQueue(epoch: number) {
   }
 }
 
-function rebuildVerificationQueueByVisibleRange() {
+function startBatchVerificationForOptimizedItems() {
+  if (!destPath.value || sourceFiles.value.length === 0) return;
+  verificationEpoch += 1;
   verificationQueue = [];
   verificationQueuedKeys.clear();
+  verificationLoadingKeys.clear();
+  verificationActiveLoads = 0;
+  itemVerificationMap.value = {};
 
-  if (!destPath.value || filteredSourceFiles.value.length === 0) return;
-  const { start, end } = virtualRange.value;
-  if (end < start) return;
-
-  const center = (start + end) / 2;
-  const indexes: number[] = [];
-  for (let idx = start; idx <= end; idx += 1) indexes.push(idx);
-  indexes.sort((a, b) => Math.abs(a - center) - Math.abs(b - center));
-
-  for (const idx of indexes) {
-    const file = filteredSourceFiles.value[idx];
-    if (!file) continue;
+  for (const file of sourceFiles.value) {
     const key = file.relativePath;
-    const current = itemVerificationMap.value[key];
-    if (current || verificationLoadingKeys.has(key)) continue;
-
-    const destDetails = destDetailsMap.value[key];
-    if (!destDetails || destDetails.loading || !!destDetails.error) continue;
+    if (migrationResultFor(key)?.status !== 'optimized') continue;
     enqueueItemVerification(file);
   }
-}
-
-function queueVisibleVerifications(cancelPending: boolean) {
-  if (cancelPending) {
-    verificationEpoch += 1;
-    verificationQueue = [];
-    verificationQueuedKeys.clear();
-    verificationLoadingKeys.clear();
-
-    for (const [key, value] of Object.entries(itemVerificationMap.value)) {
-      if (value.loading && !value.result && !value.error) {
-        delete itemVerificationMap.value[key];
-      }
-    }
-  }
-
-  rebuildVerificationQueueByVisibleRange();
   pumpItemVerificationQueue(verificationEpoch);
 }
 
-function scheduleVerificationVisibleQueue(cancelPending: boolean) {
-  verificationQueueNeedsCancel = verificationQueueNeedsCancel || cancelPending;
-  if (verificationQueueRafId != null) return;
-
-  verificationQueueRafId = requestAnimationFrame(() => {
-    const shouldCancel = verificationQueueNeedsCancel;
-    verificationQueueNeedsCancel = false;
-    verificationQueueRafId = null;
-    queueVisibleVerifications(shouldCancel);
-  });
-}
-
 function itemVerificationVerdictClass(relativePath: string): string {
+  if (migrationResultFor(relativePath)?.status !== 'optimized') return 'pending';
   const verdict = itemVerificationMap.value[relativePath]?.result?.verdict;
   if (verdict === 'pass') return 'pass';
   if (verdict === 'warn') return 'warn';
@@ -856,6 +811,7 @@ function itemVerificationVerdictClass(relativePath: string): string {
 }
 
 function itemVerificationVerdictLabel(relativePath: string): string {
+  if (migrationResultFor(relativePath)?.status !== 'optimized') return '';
   const state = itemVerificationMap.value[relativePath];
   if (!destPath.value) return '검증 대기';
   if (!state) return '검증 대기';
@@ -866,6 +822,10 @@ function itemVerificationVerdictLabel(relativePath: string): string {
   if (verdict === 'warn') return '주의';
   if (verdict === 'fail') return '검증 실패';
   return verdict ? `결과: ${verdict}` : '검증 대기';
+}
+
+function shouldShowVerification(relativePath: string): boolean {
+  return migrationResultFor(relativePath)?.status === 'optimized';
 }
 
 function migrationResultFor(relativePath: string): MigrationItemResult | null {
@@ -969,6 +929,7 @@ onMounted(() => {
         resetDestDetailLoadingState();
         updateViewportMetrics();
         void refreshDestSummary(destPath.value);
+        startBatchVerificationForOptimizedItems();
       }
     });
   })();
@@ -981,7 +942,6 @@ onBeforeUnmount(() => {
   window.removeEventListener('mouseup', stopViewerSplitDrag);
   if (queueRafId != null) cancelAnimationFrame(queueRafId);
   if (destQueueRafId != null) cancelAnimationFrame(destQueueRafId);
-  if (verificationQueueRafId != null) cancelAnimationFrame(verificationQueueRafId);
   if (viewerPanRafId != null) cancelAnimationFrame(viewerPanRafId);
   if (viewerZoomRafId != null) cancelAnimationFrame(viewerZoomRafId);
   if (scrollIdleTimer != null) window.clearTimeout(scrollIdleTimer);
@@ -1333,6 +1293,7 @@ function flushResultUpdatesNow() {
       }
     }
   }
+
 }
 
 function scheduleResultFlush(force = false) {
@@ -1372,6 +1333,13 @@ function applyResolutionPreset(width: number, height: number) {
   useMaxHeightCriteria.value = true;
   maxWidthPx.value = width;
   maxHeightPx.value = height;
+}
+
+function swapMaxResolutionValues() {
+  const nextWidth = clampRangeValue(maxHeightPx.value, 256, 12000);
+  const nextHeight = clampRangeValue(maxWidthPx.value, 256, 12000);
+  maxWidthPx.value = nextWidth;
+  maxHeightPx.value = nextHeight;
 }
 
 function clampRangeValue(value: number, min: number, max: number): number {
@@ -1678,6 +1646,7 @@ const avgPerFileText = computed(() => (avgPerFileSeconds.value == null ? '-' : f
               <span>{{ maxHeightPx }} px</span>
             </div>
             <div class="preset-buttons">
+              <button class="preset-button" @click="swapMaxResolutionValues">가로↔세로</button>
               <button class="preset-button" @click="applyResolutionPreset(1280, 720)">HD</button>
               <button class="preset-button" @click="applyResolutionPreset(1920, 1080)">FHD</button>
               <button class="preset-button" @click="applyResolutionPreset(2560, 1440)">QHD</button>
@@ -1805,17 +1774,21 @@ const avgPerFileText = computed(() => (avgPerFileSeconds.value == null ? '-' : f
                 >
                   {{ migrationFallbackCodeLabel(file.relativePath) }}
                 </div>
-                <div class="verify-chip" :class="itemVerificationVerdictClass(file.relativePath)">
+                <div
+                  v-if="shouldShowVerification(file.relativePath)"
+                  class="verify-chip"
+                  :class="itemVerificationVerdictClass(file.relativePath)"
+                >
                   {{ itemVerificationVerdictLabel(file.relativePath) }}
                 </div>
                 <div
-                  v-if="itemVerificationMap[file.relativePath]?.result"
+                  v-if="shouldShowVerification(file.relativePath) && itemVerificationMap[file.relativePath]?.result"
                   class="verify-score"
                 >
                   {{ (((itemVerificationMap[file.relativePath]?.result?.similarity ?? 0) * 100)).toFixed(1) }}%
                 </div>
                 <div
-                  v-if="itemVerificationMap[file.relativePath]?.result?.orientationIssue || itemVerificationMap[file.relativePath]?.result?.aspectIssue"
+                  v-if="shouldShowVerification(file.relativePath) && (itemVerificationMap[file.relativePath]?.result?.orientationIssue || itemVerificationMap[file.relativePath]?.result?.aspectIssue)"
                   class="verify-warning"
                 >
                   {{ itemVerificationMap[file.relativePath]?.result?.orientationIssue ? '회전/반전' : '비율/스케일' }}
