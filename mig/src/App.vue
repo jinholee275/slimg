@@ -99,6 +99,7 @@ const destPath = ref<string | null>(null);
 
 const sourceFiles = ref<FileItem[]>([]);
 const sourceScanError = ref<string | null>(null);
+const scanningSourceFolder = ref(false);
 const detailsMap = ref<Record<string, ImageDetailsState>>({});
 const destDetailsMap = ref<Record<string, ImageDetailsState | null>>({});
 const migrationRunning = ref(false);
@@ -565,6 +566,7 @@ async function refreshSourceFiles(path: string) {
   resetFailedNavigation();
   resetMigrationResults();
   resetItemVerificationState();
+  scanningSourceFolder.value = true;
   try {
     const files = await invoke<FileItem[]>('scan_folder', { path });
     sourceFiles.value = files;
@@ -580,6 +582,8 @@ async function refreshSourceFiles(path: string) {
     resetDestDetailLoadingState();
     resetItemVerificationState();
     sourceScanError.value = String(error);
+  } finally {
+    scanningSourceFolder.value = false;
   }
 }
 
@@ -1955,6 +1959,24 @@ const avgPerFileText = computed(() => (avgPerFileSeconds.value == null ? '-' : f
       </div>
     </footer>
 
+    <div v-if="scanningSourceFolder" class="progress-dialog-overlay">
+      <div class="progress-dialog" style="width: 480px;">
+        <div class="progress-dialog-body" style="text-align: center; padding: 40px 20px;">
+          <div style="margin-bottom: 20px; display: flex; justify-content: center;">
+            <div style="width: 40px; height: 40px; border: 4px solid #4a4a4a; border-top-color: #6cb2ff; border-radius: 50%; animation: scan-spin 1s infinite linear;"></div>
+          </div>
+          <div style="font-size: 18px; font-weight: 800; color: #eef8ff; margin-bottom: 12px;">
+            디렉토리 스캔 중...
+          </div>
+          <div style="font-size: 14px; color: #a3b8cc; line-height: 1.6;">
+            선택하신 원본 경로에서 파일 목록을 분석하고 있습니다.<br />
+            매우 많은 파일들이 포진되어 있다면 시간이 다소 걸릴 수 있습니다.<br />
+            잠시만 대기해주세요.
+          </div>
+        </div>
+      </div>
+    </div>
+
     <div v-if="progressDialogVisible" class="progress-dialog-overlay">
       <div class="progress-dialog">
         <div class="progress-dialog-header">
@@ -2538,6 +2560,11 @@ body,
     opacity: 0;
     transform: translate(-50%, calc(-50% - 8px)) scale(1);
   }
+}
+
+@keyframes scan-spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
 }
 
 .image-preview-wrap {

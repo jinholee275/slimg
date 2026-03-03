@@ -372,7 +372,8 @@ fn walk_migration_files(
             .to_string_lossy()
             .to_string();
         let dest_path = dest_base.join(Path::new(&relative));
-        let (orientation, dpi_x, dpi_y) = read_exif_info(&path);
+        let (orientation, _, _) = read_exif_info(&path);
+        let (dpi_x, dpi_y) = read_exif_dpi(&path);
         let (width, height) = read_image_dimensions_with_orientation(&path, orientation);
 
         output.push(MigrationTaskFile {
@@ -465,8 +466,15 @@ fn read_exif_info(path: &Path) -> (Option<u16>, Option<f32>, Option<f32>) {
 }
 
 fn read_exif_dpi(path: &Path) -> (Option<f32>, Option<f32>) {
-    let (_, dpi_x, dpi_y) = read_exif_info(path);
-    (dpi_x, dpi_y)
+    let (_, exif_x, exif_y) = read_exif_info(path);
+    // kamadak-exif 로 DPI 를 얻은 경우 그대로 반환
+    if exif_x.is_some() && exif_y.is_some() {
+        return (exif_x, exif_y);
+    }
+    // EXIF 가 없거나 부분적인 경우 포맷별 헤더에서 직접 읽어 보충
+    // (PNG pHYs, JPEG JFIF APP0, TIFF IFD, BMP XPelsPerMeter 등)
+    let (hdr_x, hdr_y) = read_dpi_from_file_header(path);
+    (exif_x.or(hdr_x), exif_y.or(hdr_y))
 }
 
 fn read_exif_orientation(path: &Path) -> Option<u16> {
@@ -477,6 +485,393 @@ fn read_exif_orientation(path: &Path) -> Option<u16> {
 fn read_image_dimensions(path: &Path) -> (Option<u32>, Option<u32>) {
     let orientation = read_exif_orientation(path);
     read_image_dimensions_with_orientation(path, orientation)
+}
+
+// ── 파일 헤더에서 컬러 정보 읽기 ───────────────────────────────────────────
+
+fn read_color_png(bytes: &[u8]) -> Option<String> {
+    // PNG: signature(8) + IHDR chunk: Length(4) + Type("IHDR")(4) + Width(4) + Height(4) + BitDepth(1) + ColorType(1)
+    if bytes.len() < 26 { return None; }
+    if &bytes[0..8] != b"\x89PNG\r\n\x1a\n" { return None; }
+    if &bytes[12..16] != b"IHDR" { return None; }
+    let bit_depth = bytes[24];
+    let color_type = bytes[25];
+    let desc = match color_type {
+        0 => match bit_depth { // Grayscale
+            1 => "흑백 (1비트)",
+            2 => "흑백 (2비트)",
+            4 => "흑백 (4비트)",
+            _ => "흑백 (Grayscale)",
+        },
+        2 => "RGB",           // Truecolor
+        3 => match bit_depth { // Indexed-colour
+            1 => "팔레트 (1비트)",
+            2 => "팔레트 (2비트)",
+            4 => "팔레트 (4비트)",
+            _ => "팔레트 (인덱스)",
+        },
+        4 => "Grayscale+Alpha",
+        6 => "RGBA",
+        _ => return None,
+    };
+    Some(desc.to_string())
+}
+
+fn read_color_jpeg(bytes: &[u8]) -> Option<String> {
+    // Scan JPEG segments for SOF marker (FFCx, not FFC4/FFC8/FFCC)
+    let mut pos = 0;
+    while pos + 1 < bytes.len() {
+        if bytes[pos] != 0xFF { return None; }
+        let marker = bytes[pos + 1];
+        pos += 2;
+        // Markers without a length field
+        if marker == 0xD8 || marker == 0xD9 || marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+            continue;
+        }
+        if pos + 2 > bytes.len() { break; }
+        let seg_len = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as usize;
+        if seg_len < 2 { break; }
+        // SOF markers: C0–CF except C4(DHT), C8(JPEG), CC(DAC)
+        if (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
+            // SOF: length(2) + precision(1) + height(2) + width(2) + Nf(1)
+            if pos + 8 > bytes.len() { break; }
+            let precision = bytes[pos + 2];
+            let nf = bytes[pos + 7];
+            let desc = match nf {
+                1 => format!("흑백 (Grayscale, {}비트)", precision),
+                3 => format!("RGB ({}비트)", precision),
+                4 => format!("CMYK ({}비트)", precision),
+                n => format!("{} 채널 ({}비트)", n, precision),
+            };
+            return Some(desc);
+        }
+        pos += seg_len;
+    }
+    None
+}
+
+fn read_color_tiff(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 8 { return None; }
+    let is_le = match &bytes[0..2] {
+        b"II" => true,
+        b"MM" => false,
+        _ => return None,
+    };
+    let read_u16 = |off: usize| -> Option<u16> {
+        if off + 2 > bytes.len() { return None; }
+        Some(if is_le { u16::from_le_bytes([bytes[off], bytes[off+1]]) }
+             else     { u16::from_be_bytes([bytes[off], bytes[off+1]]) })
+    };
+    let read_u32 = |off: usize| -> Option<u32> {
+        if off + 4 > bytes.len() { return None; }
+        Some(if is_le { u32::from_le_bytes([bytes[off], bytes[off+1], bytes[off+2], bytes[off+3]]) }
+             else     { u32::from_be_bytes([bytes[off], bytes[off+1], bytes[off+2], bytes[off+3]]) })
+    };
+    // Read a SHORT or LONG scalar from an IFD entry's value field (or offset)
+    let read_scalar = |typ: u16, count: u32, val_off: usize| -> Option<u16> {
+        let type_size: usize = match typ { 3 => 2, 4 => 4, _ => return None };
+        let data_off = if (count as usize) * type_size <= 4 { val_off }
+                       else { read_u32(val_off)? as usize };
+        match typ {
+            3 => read_u16(data_off),
+            4 => read_u32(data_off).map(|v| v as u16),
+            _ => None,
+        }
+    };
+
+    let ifd_off = read_u32(4)? as usize;
+    if ifd_off + 2 > bytes.len() { return None; }
+    let num_entries = read_u16(ifd_off)? as usize;
+
+    let mut photometric: Option<u16> = None;
+    let mut bits_per_sample: u16 = 8;
+    let mut samples_per_pixel: u16 = 1;
+
+    for i in 0..num_entries {
+        let entry_off = ifd_off + 2 + i * 12;
+        if entry_off + 12 > bytes.len() { break; }
+        let tag   = read_u16(entry_off)?;
+        let typ   = read_u16(entry_off + 2)?;
+        let count = read_u32(entry_off + 4)?;
+        let val_off = entry_off + 8;
+        match tag {
+            258 => { // BitsPerSample (read first element)
+                if let Some(v) = read_scalar(typ, count, val_off) { bits_per_sample = v; }
+            }
+            262 => { // PhotometricInterpretation
+                photometric = read_scalar(typ, count, val_off);
+            }
+            277 => { // SamplesPerPixel
+                if let Some(v) = read_scalar(typ, count, val_off) { samples_per_pixel = v; }
+            }
+            _ => {}
+        }
+    }
+
+    let photometric = photometric?;
+    let desc = match photometric {
+        0 | 1 => match bits_per_sample { // WhiteIsZero / BlackIsZero
+            1 => "흑백 (1비트)".to_string(),
+            _ => format!("흑백 (Grayscale, {}비트)", bits_per_sample),
+        },
+        2 => match samples_per_pixel { // RGB
+            3 => format!("RGB ({}비트)", bits_per_sample),
+            4 => format!("RGBA ({}비트)", bits_per_sample),
+            n => format!("RGB {} 채널 ({}비트)", n, bits_per_sample),
+        },
+        3 => "팔레트 (인덱스)".to_string(),
+        4 => "투명 마스크".to_string(),
+        5 => "CMYK".to_string(),
+        6 => format!("YCbCr ({}비트)", bits_per_sample),
+        _ => format!("Photometric {} ({}비트)", photometric, bits_per_sample),
+    };
+    Some(desc)
+}
+
+fn read_color_bmp(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 30 { return None; }
+    if &bytes[0..2] != b"BM" { return None; }
+    // DIB header size at offset 14 determines header variant
+    let dib_size = u32::from_le_bytes([bytes[14], bytes[15], bytes[16], bytes[17]]);
+    let bit_count = if dib_size == 12 {
+        // BITMAPCOREHEADER: bit count at offset 24
+        if bytes.len() < 26 { return None; }
+        u16::from_le_bytes([bytes[24], bytes[25]])
+    } else {
+        // BITMAPINFOHEADER and later: bit count at offset 28
+        u16::from_le_bytes([bytes[28], bytes[29]])
+    };
+    let desc = match bit_count {
+        1  => "흑백 (1비트)",
+        4  => "팔레트 (4비트)",
+        8  => "팔레트 (8비트)",
+        16 => "RGB (16비트)",
+        24 => "RGB (24비트)",
+        32 => "RGBA (32비트)",
+        n  => return Some(format!("{}비트", n)),
+    };
+    Some(desc.to_string())
+}
+
+fn read_color_webp(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 12 { return None; }
+    if &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WEBP" { return None; }
+    let mut pos = 12usize;
+    while pos + 8 <= bytes.len() {
+        let chunk_type = &bytes[pos..pos + 4];
+        let chunk_size = u32::from_le_bytes([bytes[pos+4], bytes[pos+5], bytes[pos+6], bytes[pos+7]]) as usize;
+        if chunk_type == b"VP8 " {
+            return Some("RGB (VP8 손실)".to_string());
+        } else if chunk_type == b"VP8L" {
+            return Some("RGBA (VP8L 무손실)".to_string());
+        } else if chunk_type == b"VP8X" {
+            // Extended: flags at pos+8, alpha flag = bit 4 (0x10)
+            if pos + 9 < bytes.len() {
+                let flags = bytes[pos + 8];
+                return Some(if flags & 0x10 != 0 {
+                    "RGBA (WebP 확장)".to_string()
+                } else {
+                    "RGB (WebP 확장)".to_string()
+                });
+            }
+        }
+        // Chunks are padded to 2-byte boundary
+        let advance = 8 + chunk_size + (chunk_size & 1);
+        if advance == 0 { break; }
+        pos += advance;
+    }
+    None
+}
+
+fn read_color_qoi(bytes: &[u8]) -> Option<String> {
+    // QOI header: magic(4) + width(4) + height(4) + channels(1) + colorspace(1) = 14 bytes
+    if bytes.len() < 14 { return None; }
+    if &bytes[0..4] != b"qoif" { return None; }
+    let desc = match bytes[12] {
+        3 => "RGB",
+        4 => "RGBA",
+        _ => return None,
+    };
+    Some(desc.to_string())
+}
+
+/// 파일 헤더에서 직접 컬러 정보를 읽어 사람이 읽기 좋은 문자열로 반환.
+/// 포맷은 magic bytes로 감지하므로 파일 확장자와 무관하게 동작.
+fn read_color_from_file_header(path: &Path) -> Option<String> {
+    let format = detect_real_image_format(path)?;
+    // 파일을 미리 읽어 두고 각 파서에 슬라이스를 넘김
+    let bytes = fs::read(path).ok()?;
+    match format {
+        RealImageFormat::Png      => read_color_png(&bytes),
+        RealImageFormat::Jpeg     => read_color_jpeg(&bytes),
+        RealImageFormat::Tiff     => read_color_tiff(&bytes),
+        RealImageFormat::Bmp      => read_color_bmp(&bytes),
+        RealImageFormat::Gif      => Some("팔레트 (인덱스)".to_string()),
+        RealImageFormat::WebP     => read_color_webp(&bytes),
+        RealImageFormat::Qoi      => read_color_qoi(&bytes),
+        // JXL / AVIF / HEIC: 헤더 구조가 복잡하므로 None 반환 (호출 측에서 폴백 처리)
+        RealImageFormat::Jxl | RealImageFormat::Avif | RealImageFormat::HeicLike => None,
+    }
+}
+
+// ── 파일 헤더에서 DPI 정보 읽기 ─────────────────────────────────────────────
+
+fn read_dpi_png(bytes: &[u8]) -> (Option<f32>, Option<f32>) {
+    // pHYs 청크: X(4) + Y(4) + Unit(1), unit=1 이면 pixels per metre
+    if bytes.len() < 8 || &bytes[0..8] != b"\x89PNG\r\n\x1a\n" {
+        return (None, None);
+    }
+    let mut pos = 8usize;
+    while pos + 12 <= bytes.len() {
+        let length = u32::from_be_bytes([bytes[pos], bytes[pos+1], bytes[pos+2], bytes[pos+3]]) as usize;
+        let ctype  = &bytes[pos+4..pos+8];
+        if ctype == b"pHYs" && pos + 17 <= bytes.len() {
+            let xppu = u32::from_be_bytes([bytes[pos+8], bytes[pos+9], bytes[pos+10], bytes[pos+11]]);
+            let yppu = u32::from_be_bytes([bytes[pos+12], bytes[pos+13], bytes[pos+14], bytes[pos+15]]);
+            let unit = bytes[pos+16];
+            if unit == 1 && xppu > 0 && yppu > 0 {
+                // 1 inch = 0.0254 m  →  DPI = ppm × 0.0254
+                return (Some(xppu as f32 * 0.0254), Some(yppu as f32 * 0.0254));
+            }
+            break; // pHYs 발견했으나 단위 없음
+        }
+        // pHYs 는 IDAT 이전에 있어야 하므로 IDAT/IEND 이후는 불필요
+        if ctype == b"IDAT" || ctype == b"IEND" { break; }
+        pos += 8 + length + 4; // chunk header(8) + data + CRC(4)
+    }
+    (None, None)
+}
+
+fn read_dpi_jpeg_jfif(bytes: &[u8]) -> (Option<f32>, Option<f32>) {
+    // JFIF APP0 (FF E0): identifier(5) + ver(2) + units(1) + Xdensity(2) + Ydensity(2)
+    if bytes.len() < 4 || &bytes[0..3] != b"\xFF\xD8\xFF" { return (None, None); }
+    let mut pos = 2usize;
+    while pos + 1 < bytes.len() {
+        if bytes[pos] != 0xFF { break; }
+        let marker = bytes[pos + 1];
+        pos += 2;
+        if marker == 0xD8 || marker == 0xD9 || marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+            continue;
+        }
+        if pos + 2 > bytes.len() { break; }
+        let seg_len = u16::from_be_bytes([bytes[pos], bytes[pos+1]]) as usize;
+        if seg_len < 2 { break; }
+        if marker == 0xE0 && seg_len >= 14 && pos + seg_len <= bytes.len() {
+            if &bytes[pos+2..pos+7] == b"JFIF\x00" {
+                let units    = bytes[pos+9];
+                let xdensity = u16::from_be_bytes([bytes[pos+10], bytes[pos+11]]) as f32;
+                let ydensity = u16::from_be_bytes([bytes[pos+12], bytes[pos+13]]) as f32;
+                if xdensity > 0.0 && ydensity > 0.0 {
+                    return match units {
+                        1 => (Some(xdensity), Some(ydensity)),                // DPI
+                        2 => (Some(xdensity * 2.54), Some(ydensity * 2.54)), // DPCM → DPI
+                        _ => (None, None), // 0 = 비율만, 절대 DPI 없음
+                    };
+                }
+            }
+        }
+        if marker == 0xDA { break; } // SOS — 이후는 이미지 데이터
+        pos += seg_len;
+    }
+    (None, None)
+}
+
+fn read_dpi_tiff_ifd(bytes: &[u8]) -> (Option<f32>, Option<f32>) {
+    // ? 연산자를 사용하기 위해 Option 반환 내부 함수로 위임
+    fn inner(bytes: &[u8]) -> Option<(Option<f32>, Option<f32>)> {
+        if bytes.len() < 8 { return None; }
+        let is_le = match &bytes[0..2] {
+            b"II" => true,
+            b"MM" => false,
+            _ => return None,
+        };
+        let ru16 = |off: usize| -> Option<u16> {
+            if off + 2 > bytes.len() { return None; }
+            Some(if is_le { u16::from_le_bytes([bytes[off], bytes[off+1]]) }
+                 else     { u16::from_be_bytes([bytes[off], bytes[off+1]]) })
+        };
+        let ru32 = |off: usize| -> Option<u32> {
+            if off + 4 > bytes.len() { return None; }
+            Some(if is_le { u32::from_le_bytes([bytes[off], bytes[off+1], bytes[off+2], bytes[off+3]]) }
+                 else     { u32::from_be_bytes([bytes[off], bytes[off+1], bytes[off+2], bytes[off+3]]) })
+        };
+        let rational = |off: usize| -> Option<f32> {
+            let n = ru32(off)?;
+            let d = ru32(off + 4)?;
+            if d == 0 { None } else { Some(n as f32 / d as f32) }
+        };
+
+        let ifd_off = ru32(4)? as usize;
+        if ifd_off + 2 > bytes.len() { return None; }
+        let nentries = ru16(ifd_off)? as usize;
+
+        let mut xres: Option<f32> = None;
+        let mut yres: Option<f32> = None;
+        let mut unit: u16 = 2; // 기본값: inch
+
+        for i in 0..nentries {
+            let eoff = ifd_off + 2 + i * 12;
+            if eoff + 12 > bytes.len() { break; }
+            let tag = match ru16(eoff) { Some(v) => v, None => break };
+            let typ = match ru16(eoff + 2) { Some(v) => v, None => break };
+            let val_off = eoff + 8;
+            match (tag, typ) {
+                (282, 5) => { // XResolution, RATIONAL (8 bytes → 항상 오프셋 포인터)
+                    if let Some(data_off) = ru32(val_off).map(|v| v as usize) {
+                        xres = rational(data_off);
+                    }
+                }
+                (283, 5) => { // YResolution, RATIONAL
+                    if let Some(data_off) = ru32(val_off).map(|v| v as usize) {
+                        yres = rational(data_off);
+                    }
+                }
+                (296, 3) => { // ResolutionUnit, SHORT
+                    if let Some(u) = ru16(val_off) { unit = u; }
+                }
+                _ => {}
+            }
+        }
+
+        let convert = |v: f32| if unit == 3 { v * 2.54 } else { v }; // cm → inch
+        Some((xres.map(convert), yres.map(convert)))
+    }
+    inner(bytes).unwrap_or((None, None))
+}
+
+fn read_dpi_bmp(bytes: &[u8]) -> (Option<f32>, Option<f32>) {
+    // BITMAPINFOHEADER(40+): XPelsPerMeter(offset 38), YPelsPerMeter(offset 42)
+    if bytes.len() < 46 || &bytes[0..2] != b"BM" { return (None, None); }
+    let dib_size = u32::from_le_bytes([bytes[14], bytes[15], bytes[16], bytes[17]]);
+    if dib_size < 40 { return (None, None); } // BITMAPCOREHEADER 는 DPI 필드 없음
+    let x_ppm = i32::from_le_bytes([bytes[38], bytes[39], bytes[40], bytes[41]]);
+    let y_ppm = i32::from_le_bytes([bytes[42], bytes[43], bytes[44], bytes[45]]);
+    if x_ppm > 0 && y_ppm > 0 {
+        // pixels per metre → DPI
+        (Some(x_ppm as f32 * 0.0254), Some(y_ppm as f32 * 0.0254))
+    } else {
+        (None, None)
+    }
+}
+
+/// 파일 헤더에서 DPI를 읽어 반환. 포맷은 magic bytes로 감지.
+/// kamadak-exif 가 읽지 못하는 PNG pHYs, JPEG JFIF APP0, BMP XPelsPerMeter 등을 커버.
+fn read_dpi_from_file_header(path: &Path) -> (Option<f32>, Option<f32>) {
+    let format = match detect_real_image_format(path) {
+        Some(f) => f,
+        None => return (None, None),
+    };
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return (None, None),
+    };
+    match format {
+        RealImageFormat::Png  => read_dpi_png(&bytes),
+        RealImageFormat::Jpeg => read_dpi_jpeg_jfif(&bytes),
+        RealImageFormat::Tiff => read_dpi_tiff_ifd(&bytes),
+        RealImageFormat::Bmp  => read_dpi_bmp(&bytes),
+        _ => (None, None),
+    }
 }
 
 /// FillOrder=2(LSB-first) TIFF를 수정: 스트립 데이터 비트 반전 + FillOrder 태그를 1로 패치.
@@ -1220,7 +1615,8 @@ fn get_image_details_sync(path: String) -> Result<ImageDetails, String> {
         (Some(w), Some(h)) => (w, h),
         _ => img.dimensions(),
     };
-    let color = Some(format!("{:?}", img.color()));
+    let color = read_color_from_file_header(&file_path)
+        .or_else(|| Some(format!("{:?}", img.color())));
 
     Ok(ImageDetails {
         display_data_url: build_display_data_url(&file_path),
