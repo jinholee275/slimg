@@ -479,6 +479,108 @@ fn read_image_dimensions(path: &Path) -> (Option<u32>, Option<u32>) {
     read_image_dimensions_with_orientation(path, orientation)
 }
 
+/// FillOrder=2(LSB-first) TIFF를 수정: 스트립 데이터 비트 반전 + FillOrder 태그를 1로 패치.
+/// `image` 크레이트의 tiff 디코더(fax 크레이트)가 MSB-first만 지원하기 때문에 필요.
+fn try_fix_tiff_lsb_fill_order(bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.len() < 8 {
+        return None;
+    }
+    let is_le = match &bytes[..2] {
+        b"II" => true,
+        b"MM" => false,
+        _ => return None,
+    };
+
+    let read_u16 = |b: &[u8], off: usize| -> Option<u16> {
+        if off + 2 > b.len() { return None; }
+        Some(if is_le { u16::from_le_bytes([b[off], b[off+1]]) }
+             else     { u16::from_be_bytes([b[off], b[off+1]]) })
+    };
+    let read_u32 = |b: &[u8], off: usize| -> Option<u32> {
+        if off + 4 > b.len() { return None; }
+        Some(if is_le { u32::from_le_bytes([b[off], b[off+1], b[off+2], b[off+3]]) }
+             else     { u32::from_be_bytes([b[off], b[off+1], b[off+2], b[off+3]]) })
+    };
+
+    // IFD 내 태그 값(SHORT 또는 LONG 배열)을 usize 벡터로 읽는 헬퍼
+    let read_values = |b: &[u8], typ: u16, count: usize, val_or_off: usize| -> Option<Vec<usize>> {
+        let type_size: usize = match typ { 3 => 2, 4 => 4, _ => return None };
+        let total_size = count * type_size;
+        let data_off = if total_size <= 4 {
+            val_or_off
+        } else {
+            read_u32(b, val_or_off)? as usize
+        };
+        if data_off + total_size > b.len() { return None; }
+        let mut vals = Vec::with_capacity(count);
+        for i in 0..count {
+            let off = data_off + i * type_size;
+            let v = match typ {
+                3 => read_u16(b, off)? as usize,
+                4 => read_u32(b, off)? as usize,
+                _ => unreachable!(),
+            };
+            vals.push(v);
+        }
+        Some(vals)
+    };
+
+    let ifd_offset = read_u32(bytes, 4)? as usize;
+    if ifd_offset + 2 > bytes.len() { return None; }
+    let num_entries = read_u16(bytes, ifd_offset)? as usize;
+
+    let mut fill_order_val_off: Option<usize> = None;
+    let mut strip_offsets: Vec<usize> = Vec::new();
+    let mut strip_byte_counts: Vec<usize> = Vec::new();
+
+    for i in 0..num_entries {
+        let entry_off = ifd_offset + 2 + i * 12;
+        if entry_off + 12 > bytes.len() { break; }
+        let tag   = read_u16(bytes, entry_off)?;
+        let typ   = read_u16(bytes, entry_off + 2)?;
+        let count = read_u32(bytes, entry_off + 4)? as usize;
+        let val_or_off = entry_off + 8;
+        match tag {
+            266 => { // FillOrder
+                if typ == 3 {
+                    let val = read_u16(bytes, val_or_off)?;
+                    if val != 2 { return None; } // LSB-first가 아니면 패치 불필요
+                    fill_order_val_off = Some(val_or_off);
+                }
+            }
+            273 => { // StripOffsets
+                strip_offsets = read_values(bytes, typ, count, val_or_off)?;
+            }
+            279 => { // StripByteCounts
+                strip_byte_counts = read_values(bytes, typ, count, val_or_off)?;
+            }
+            _ => {}
+        }
+    }
+
+    let fill_order_val_off = fill_order_val_off?; // FillOrder=2 없으면 Nothing to do
+    if strip_offsets.is_empty() || strip_offsets.len() != strip_byte_counts.len() {
+        return None;
+    }
+
+    let mut result = bytes.to_vec();
+
+    // FillOrder 태그를 1(MSB-first)로 패치
+    if is_le { result[fill_order_val_off] = 1; result[fill_order_val_off + 1] = 0; }
+    else      { result[fill_order_val_off] = 0; result[fill_order_val_off + 1] = 1; }
+
+    // 각 스트립 데이터의 바이트별 비트 순서 반전
+    for (&off, &len) in strip_offsets.iter().zip(strip_byte_counts.iter()) {
+        let end = off + len;
+        if end > result.len() { return None; }
+        for b in &mut result[off..end] {
+            *b = b.reverse_bits();
+        }
+    }
+
+    Some(result)
+}
+
 fn load_image_with_fallback(path: &Path) -> Result<image::DynamicImage, String> {
     let bytes = fs::read(path)
         .map_err(|e| format!("파일 읽기 실패: {} ({})", path.display(), e))?;
@@ -490,7 +592,18 @@ fn load_image_with_fallback(path: &Path) -> Result<image::DynamicImage, String> 
         return Ok(img);
     }
 
-    image::open(path).map_err(|e| format!("이미지 디코드 실패: {}", e))
+    if let Ok(img) = image::open(path) {
+        return Ok(img);
+    }
+
+    // TIFF 전용 폴백: FillOrder=2(LSB-first) 파일 → 비트 반전 후 재시도
+    if let Some(fixed) = try_fix_tiff_lsb_fill_order(&bytes) {
+        if let Ok(img) = image::load_from_memory(&fixed) {
+            return Ok(img);
+        }
+    }
+
+    Err(format!("이미지 디코드 실패: {}", path.display()))
 }
 
 fn init_gpu_resize_context() -> Result<Arc<GpuResizeContext>, String> {
@@ -831,7 +944,17 @@ fn build_display_data_url(path: &Path) -> Option<String> {
     // WebView2(Chromium) DOES NOT support TIFF/BMP natively.
     // Convert them to PNG for display preview.
     if matches!(ext.as_str(), "tif" | "tiff" | "bmp") {
-        if let Ok(img) = image::load_from_memory(&bytes) {
+        // 1차 시도: 표준 디코드
+        let img = image::load_from_memory(&bytes).ok().or_else(|| {
+            // 2차 시도: FillOrder=2(LSB-first) TIFF 전용 패치 후 재시도
+            if matches!(ext.as_str(), "tif" | "tiff") {
+                try_fix_tiff_lsb_fill_order(&bytes)
+                    .and_then(|fixed| image::load_from_memory(&fixed).ok())
+            } else {
+                None
+            }
+        });
+        if let Some(img) = img {
             // Thumbnail for preview performance
             let preview = img.thumbnail(1200, 1200);
             let mut buffer = Cursor::new(Vec::new());
@@ -840,6 +963,8 @@ fn build_display_data_url(path: &Path) -> Option<String> {
                 return Some(format!("data:image/png;base64,{}", encoded));
             }
         }
+        // TIFF/BMP를 어떻게도 디코드할 수 없으면 None 반환 (브라우저가 렌더 불가)
+        return None;
     }
 
     let encoded = BASE64_STANDARD.encode(bytes);
