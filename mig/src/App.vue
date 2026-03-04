@@ -162,6 +162,9 @@ const useMaxHeightCriteria = ref(false);
 const maxHeightPx = ref(4000);
 const restoreMetadata = ref(true);
 const accelerationMode = ref<AccelerationMode>('auto');
+const useColorCriteria = ref(false);
+const targetColorMode = ref<'monochrome' | 'grayscale' | 'rgb' | 'rgba'>('grayscale');
+const encodeQuality = ref(100);
 const concurrencyProfile = ref<ConcurrencyProfile>({
   cpuCores: 4,
   min: 1,
@@ -998,6 +1001,9 @@ async function startMigration() {
       maxHeight: maxHeightPx.value,
       restoreMetadata: restoreMetadata.value,
       accelerationMode: accelerationMode.value,
+      useColor: useColorCriteria.value,
+      targetColorMode: targetColorMode.value,
+      encodeQuality: encodeQuality.value,
     });
     migrationRunning.value = true;
   } catch (error) {
@@ -1588,6 +1594,29 @@ const avgPerFileText = computed(() => (avgPerFileSeconds.value == null ? '-' : f
           </div>
           <div class="toolbar-line">
             <div class="toolbar-slider">
+              <label for="encode-quality-range">인코딩 품질</label>
+              <input
+                id="encode-quality-range"
+                v-model.number="encodeQuality"
+                type="range"
+                min="1"
+                max="100"
+                step="1"
+              />
+              <div class="number-input-wrap">
+                <input
+                  v-model.number="encodeQuality"
+                  class="range-number-input"
+                  type="number"
+                  min="1"
+                  max="100"
+                  step="1"
+                  @change="encodeQuality = Math.min(100, Math.max(1, encodeQuality))"
+                />
+                <span class="number-input-unit">%</span>
+              </div>
+            </div>
+            <div class="toolbar-slider">
               <label class="criteria-toggle">
                 <input v-model="useDpiCriteria" type="checkbox" />
                 <span>기준 DPI</span>
@@ -1681,6 +1710,32 @@ const avgPerFileText = computed(() => (avgPerFileSeconds.value == null ? '-' : f
               </div>
             </div>
           </div>
+          <div class="toolbar-line">
+            <div class="toolbar-slider color-criteria-row">
+              <label class="criteria-toggle">
+                <input v-model="useColorCriteria" type="checkbox" />
+                <span>색상 기준</span>
+              </label>
+              <div class="color-mode-buttons" :class="{ disabled: !useColorCriteria }">
+                <button
+                  v-for="mode in (['monochrome', 'grayscale', 'rgb', 'rgba'] as const)"
+                  :key="mode"
+                  class="color-mode-btn"
+                  :class="{ active: targetColorMode === mode }"
+                  :disabled="!useColorCriteria"
+                  @click="targetColorMode = mode"
+                >
+                  {{ mode === 'monochrome' ? '흑백' : mode === 'grayscale' ? '회색' : mode.toUpperCase() }}
+                </button>
+              </div>
+              <span class="color-mode-hint" v-if="useColorCriteria">
+                {{ targetColorMode === 'monochrome' ? '흑백 이미지만 1bit 변환'
+                  : targetColorMode === 'grayscale' ? '회색조 이미지 Grayscale 변환'
+                  : targetColorMode === 'rgb' ? '불투명 이미지 알파 제거'
+                  : 'RGBA 유지 (변환 없음)' }}
+              </span>
+            </div>
+          </div>
         </div>
         <div class="toolbar-filters">
           <button class="filter-button" :class="{ active: statusFilters.pending }" @click="toggleStatusFilter('pending')">
@@ -1709,17 +1764,18 @@ const avgPerFileText = computed(() => (avgPerFileSeconds.value == null ? '-' : f
         </div>
       </section>
 
-      <section ref="listScrollRef" class="list-panel" @scroll="onListScroll">
-        <div class="section-title-row">
-          <div class="section-side-summary left">{{ sourceListSummaryText }}</div>
-          <div class="section-title-wrap">
-            <div class="section-title">이미지 목록</div>
-            <div v-if="migrationProgress.done" class="section-title-reduction" :class="{ positive: reductionInfo.positive }">
-              {{ reductionInfo.label }}
-            </div>
+      <div class="section-title-row">
+        <div class="section-side-summary left">{{ sourceListSummaryText }}</div>
+        <div class="section-title-wrap">
+          <div class="section-title">이미지 목록</div>
+          <div v-if="migrationProgress.done" class="section-title-reduction" :class="{ positive: reductionInfo.positive }">
+            {{ reductionInfo.label }}
           </div>
-          <div class="section-side-summary right">{{ destListSummaryText }}</div>
         </div>
+        <div class="section-side-summary right">{{ destListSummaryText }}</div>
+      </div>
+
+      <section ref="listScrollRef" class="list-panel" @scroll="onListScroll">
         <div v-if="sourceScanError" class="panel-message">{{ sourceScanError }}</div>
         <div v-else-if="!sourcePath" class="panel-message">원본 폴더를 먼저 선택하세요.</div>
         <div v-else-if="sourceFiles.length === 0" class="panel-message">표시할 원본 파일이 없습니다.</div>
@@ -2017,7 +2073,8 @@ const avgPerFileText = computed(() => (avgPerFileSeconds.value == null ? '-' : f
             <div class="progress-fill" :style="{ width: `${migrationProgressPercent}%` }"></div>
           </div>
           <div class="progress-line-sub">
-            {{ migrationProgress.processed }} / {{ migrationProgress.total }}
+            <span class="progress-line-status">{{ statusLineText }}</span>
+            <span class="progress-line-count">{{ migrationProgress.processed }} / {{ migrationProgress.total }}</span>
           </div>
 
           <div class="progress-stats">
@@ -2122,6 +2179,45 @@ body,
 .swap-button {
   padding: 3px 6px;
   flex-shrink: 0;
+}
+
+.color-criteria-row {
+  flex-wrap: wrap;
+}
+
+.color-mode-buttons {
+  display: flex;
+  gap: 4px;
+}
+
+.color-mode-buttons.disabled {
+  opacity: 0.4;
+}
+
+.color-mode-btn {
+  padding: 2px 10px;
+  font-size: 12px;
+  background-color: #3a3a3a;
+  border: 1px solid #5a5a5a;
+  border-radius: 4px;
+  color: #cfcfcf;
+  cursor: pointer;
+}
+
+.color-mode-btn.active {
+  background-color: #4a90d9;
+  border-color: #6aaeff;
+  color: #fff;
+}
+
+.color-mode-btn:disabled {
+  cursor: default;
+}
+
+.color-mode-hint {
+  color: #888;
+  font-size: 11px;
+  white-space: nowrap;
 }
 
 .criteria-toggle {
@@ -2746,8 +2842,10 @@ body,
 }
 
 .image-viewer-image {
-  max-width: 100%;
-  max-height: 100%;
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
   object-fit: contain;
   transform-origin: center center;
   transition: none;
@@ -2908,9 +3006,25 @@ body,
 
 .progress-line-sub {
   margin-top: -4px;
-  font-size: 14px;
+  font-size: 13px;
   color: #c7d0da;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.progress-line-status {
+  text-align: left;
+  color: #bfc9d4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.progress-line-count {
   text-align: right;
+  white-space: nowrap;
 }
 
 .progress-stats {

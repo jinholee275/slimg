@@ -2160,6 +2160,7 @@ dependencies = [
  "img_hash",
  "kamadak-exif",
  "little_exif",
+ "mozjpeg",
  "pollster",
  "rayon",
  "rgb",

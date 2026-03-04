@@ -135,6 +135,7 @@ struct GpuResizeContext {
     bgl: wgpu::BindGroupLayout,
     pipeline: wgpu::RenderPipeline,
     sampler: wgpu::Sampler,
+    adapter_name: String,
 }
 
 #[derive(Clone)]
@@ -150,6 +151,20 @@ struct MigrationTaskFile {
     height: Option<u32>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ColorMode {
+    Monochrome, // 1-bit black & white
+    Grayscale,  // 8-bit gray
+    Rgb,        // 24-bit
+    Rgba,       // 32-bit
+}
+
+#[derive(Clone, Copy)]
+struct ColorCriteria {
+    enabled: bool,
+    target_mode: ColorMode,
+}
+
 #[derive(Clone, Copy)]
 struct OptimizationCriteria {
     use_dpi: bool,
@@ -158,18 +173,25 @@ struct OptimizationCriteria {
     max_width: u32,
     use_max_height: bool,
     max_height: u32,
+    color: ColorCriteria,
 }
 
 #[derive(Clone, Copy)]
 struct MigrationOptions {
     restore_metadata: bool,
     acceleration_mode: AccelerationMode,
+    encode_quality: u8,
 }
 
 #[derive(Clone, Copy)]
 struct OptimizationPlan {
     scale: f32,
     apply_target_dpi: bool,
+    /// Resolved color transform (already analyzed against actual pixel data).
+    /// `None` means no color transform, OR color needs lazy analysis (see `pending_color`).
+    color_transform: Option<ColorMode>,
+    /// If `Some`, color analysis is deferred — run `analyze_color_mode` then apply if result <= target.
+    pending_color: Option<ColorMode>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -209,11 +231,11 @@ fn resolve_acceleration_backend(mode: AccelerationMode) -> (&'static str, Option
     match mode {
         AccelerationMode::Cpu => ("cpu", None),
         AccelerationMode::Auto => match get_gpu_resize_context() {
-            Ok(_) => ("auto", Some("Auto 모드: 파일별로 CPU/GPU 동적 선택".to_string())),
+            Ok(ctx) => ("auto", Some(format!("Auto 모드: 파일별 CPU/GPU 동적 선택 [{}]", ctx.adapter_name))),
             Err(e) => ("auto", Some(format!("Auto 모드: GPU 사용 불가로 CPU 사용 ({})", e))),
         },
         AccelerationMode::GpuPreferred => match get_gpu_resize_context() {
-            Ok(_) => ("gpu", Some("GPU 리사이즈 활성화".to_string())),
+            Ok(ctx) => ("gpu", Some(format!("GPU 리사이즈 활성화 [{}]", ctx.adapter_name))),
             Err(e) => ("cpu", Some(format!("GPU 우선 모드 실패로 CPU 폴백: {}", e))),
         },
     }
@@ -976,6 +998,113 @@ fn try_fix_tiff_lsb_fill_order(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(result)
 }
 
+fn is_palette_1bit_source(path: &Path) -> bool {
+    read_color_from_file_header(path)
+        .map(|v| v.contains("팔레트 (1비트)"))
+        .unwrap_or(false)
+}
+
+fn read_png_phys_chunk(bytes: &[u8]) -> Option<(u32, u32, u8)> {
+    if bytes.len() < 8 || &bytes[0..8] != b"\x89PNG\r\n\x1a\n" {
+        return None;
+    }
+    let mut pos = 8usize;
+    while pos + 12 <= bytes.len() {
+        let length = u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]) as usize;
+        if pos + 12 + length > bytes.len() {
+            return None;
+        }
+        let ctype = &bytes[pos + 4..pos + 8];
+        if ctype == b"pHYs" && length == 9 {
+            let xppu = u32::from_be_bytes([bytes[pos + 8], bytes[pos + 9], bytes[pos + 10], bytes[pos + 11]]);
+            let yppu = u32::from_be_bytes([bytes[pos + 12], bytes[pos + 13], bytes[pos + 14], bytes[pos + 15]]);
+            let unit = bytes[pos + 16];
+            return Some((xppu, yppu, unit));
+        }
+        if ctype == b"IEND" {
+            break;
+        }
+        pos += 12 + length;
+    }
+    None
+}
+
+fn crc32_png(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg() & 0xEDB8_8320;
+            crc = (crc >> 1) ^ mask;
+        }
+    }
+    !crc
+}
+
+fn build_png_phys_chunk(xppu: u32, yppu: u32, unit: u8) -> Vec<u8> {
+    let mut chunk = Vec::with_capacity(4 + 4 + 9 + 4);
+    chunk.extend_from_slice(&9u32.to_be_bytes());
+    chunk.extend_from_slice(b"pHYs");
+    chunk.extend_from_slice(&xppu.to_be_bytes());
+    chunk.extend_from_slice(&yppu.to_be_bytes());
+    chunk.push(unit);
+    let mut crc_input = Vec::with_capacity(4 + 9);
+    crc_input.extend_from_slice(b"pHYs");
+    crc_input.extend_from_slice(&xppu.to_be_bytes());
+    crc_input.extend_from_slice(&yppu.to_be_bytes());
+    crc_input.push(unit);
+    let crc = crc32_png(&crc_input);
+    chunk.extend_from_slice(&crc.to_be_bytes());
+    chunk
+}
+
+fn upsert_png_phys_chunk(bytes: &[u8], xppu: u32, yppu: u32, unit: u8) -> Result<Vec<u8>, String> {
+    if bytes.len() < 8 || &bytes[0..8] != b"\x89PNG\r\n\x1a\n" {
+        return Err("PNG 시그니처가 아닙니다.".to_string());
+    }
+
+    let phys_chunk = build_png_phys_chunk(xppu, yppu, unit);
+    let mut out = Vec::with_capacity(bytes.len() + phys_chunk.len());
+    out.extend_from_slice(&bytes[0..8]);
+
+    let mut pos = 8usize;
+    let mut inserted = false;
+    while pos + 12 <= bytes.len() {
+        let length = u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]) as usize;
+        let chunk_end = pos + 12 + length;
+        if chunk_end > bytes.len() {
+            return Err("PNG 청크 길이가 잘못되었습니다.".to_string());
+        }
+        let ctype = &bytes[pos + 4..pos + 8];
+
+        if ctype == b"pHYs" {
+            if !inserted {
+                out.extend_from_slice(&phys_chunk);
+                inserted = true;
+            }
+            pos = chunk_end;
+            continue;
+        }
+
+        if !inserted && (ctype == b"IDAT" || ctype == b"IEND") {
+            out.extend_from_slice(&phys_chunk);
+            inserted = true;
+        }
+
+        out.extend_from_slice(&bytes[pos..chunk_end]);
+        pos = chunk_end;
+        if ctype == b"IEND" {
+            break;
+        }
+    }
+
+    if !inserted {
+        out.extend_from_slice(&phys_chunk);
+    }
+
+    Ok(out)
+}
+
 /// TIFF IFD에서 PhotometricInterpretation 값만 빠르게 읽어 Palette(3) 여부 반환.
 /// 파일을 전부 읽지 않고 magic prefix만으로 판별한다.
 fn is_palette_tiff(bytes: &[u8]) -> bool {
@@ -1300,6 +1429,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }))
     .ok_or_else(|| "GPU 어댑터를 찾지 못했습니다.".to_string())?;
 
+    let adapter_info = adapter.get_info();
+    let adapter_name = format!("{} ({:?})", adapter_info.name, adapter_info.device_type);
+
     let (device, queue) = pollster::block_on(adapter.request_device(
         &wgpu::DeviceDescriptor {
             label: Some("image-opt-gpu-device"),
@@ -1379,6 +1511,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         bgl,
         pipeline,
         sampler,
+        adapter_name,
     }))
 }
 
@@ -1900,7 +2033,79 @@ fn get_image_details_sync(path: String) -> Result<ImageDetails, String> {
     })
 }
 
-fn compute_required_scale(file: &MigrationTaskFile, criteria: OptimizationCriteria) -> Option<OptimizationPlan> {
+/// Sample ~1% of pixels in a grid pattern to determine actual color mode.
+/// Returns the *lowest* mode that accurately describes the image content.
+fn analyze_color_mode(data: &[u8], width: u32, height: u32) -> ColorMode {
+    if width == 0 || height == 0 || data.len() < 4 {
+        return ColorMode::Rgba;
+    }
+
+    let total_pixels = (width as u64) * (height as u64);
+    // Sample stride: ~1% of pixels, at least 1, at most a reasonable cap
+    let stride = ((total_pixels / 100).max(1) as u32).min(width.max(height));
+
+    let mut has_alpha = false;
+    let mut is_gray = true;
+    let mut unique_colors: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut check_mono = true;
+
+    let mut y = 0u32;
+    while y < height {
+        let mut x = 0u32;
+        while x < width {
+            let idx = ((y as u64 * width as u64 + x as u64) * 4) as usize;
+            if idx + 3 >= data.len() {
+                x += stride;
+                continue;
+            }
+            let r = data[idx];
+            let g = data[idx + 1];
+            let b = data[idx + 2];
+            let a = data[idx + 3];
+
+            if a < 255 {
+                has_alpha = true;
+            }
+
+            if is_gray {
+                let dr = (r as i16 - g as i16).unsigned_abs();
+                let dg = (g as i16 - b as i16).unsigned_abs();
+                if dr > 4 || dg > 4 {
+                    is_gray = false;
+                    check_mono = false;
+                }
+            }
+
+            if check_mono && is_gray {
+                let packed = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+                unique_colors.insert(packed);
+                if unique_colors.len() > 2 {
+                    check_mono = false;
+                }
+            }
+
+            x += stride;
+        }
+        y += stride;
+    }
+
+    if has_alpha {
+        return ColorMode::Rgba;
+    }
+    if !is_gray {
+        return ColorMode::Rgb;
+    }
+    // All samples are gray — check if monochrome (pure black/white only)
+    if check_mono && unique_colors.len() <= 2 {
+        let all_bw = unique_colors.iter().all(|&c| c == 0x000000 || c == 0xFFFFFF);
+        if all_bw {
+            return ColorMode::Monochrome;
+        }
+    }
+    ColorMode::Grayscale
+}
+
+fn compute_optimization_plan(file: &MigrationTaskFile, criteria: OptimizationCriteria, image_data: Option<&[u8]>) -> Option<OptimizationPlan> {
     let mut required_scales: Vec<f32> = Vec::new();
     let mut apply_target_dpi = false;
 
@@ -1941,23 +2146,51 @@ fn compute_required_scale(file: &MigrationTaskFile, criteria: OptimizationCriter
         }
     }
 
-    if required_scales.is_empty() {
+    // Determine color transform
+    let (color_transform, pending_color) = if criteria.color.enabled {
+        let target = criteria.color.target_mode;
+        if let (Some(data), Some(w), Some(h)) = (image_data, file.width, file.height) {
+            // Pixel data available — resolve now
+            let actual = analyze_color_mode(data, w, h);
+            let resolved = if actual == ColorMode::Monochrome && target == ColorMode::Grayscale {
+                None
+            } else if actual <= target {
+                Some(actual.min(target))
+            } else {
+                None
+            };
+            (resolved, None)
+        } else {
+            // Defer analysis — will be done after decoding inside the resize function
+            (None, Some(target))
+        }
+    } else {
+        (None, None)
+    };
+
+    let has_scale = !required_scales.is_empty();
+    let scale = if has_scale {
+        required_scales
+            .into_iter()
+            .fold(1.0_f32, |acc, value| acc.min(value))
+            .clamp(0.01, 1.0)
+    } else {
+        1.0
+    };
+
+    let needs_resize = has_scale && scale < 1.0;
+    let needs_color = color_transform.is_some() || pending_color.is_some();
+
+    if !needs_resize && !needs_color {
         return None;
     }
 
-    let scale = required_scales
-        .into_iter()
-        .fold(1.0_f32, |acc, value| acc.min(value))
-        .clamp(0.01, 1.0);
-
-    if scale >= 1.0 {
-        None
-    } else {
-        Some(OptimizationPlan {
-            scale,
-            apply_target_dpi,
-        })
-    }
+    Some(OptimizationPlan {
+        scale: if needs_resize { scale } else { 1.0 },
+        apply_target_dpi,
+        color_transform,
+        pending_color,
+    })
 }
 
 fn normalize_slimg_image_orientation(
@@ -2009,24 +2242,52 @@ fn copy_metadata_best_effort(
     set_target_dpi: Option<u32>,
 ) -> String {
     let detected = detect_real_image_format(source_path);
-    let mut metadata = match LittleExifMetadata::new_from_path(source_path) {
-        Ok(v) => v,
-        Err(e) => return format!("메타데이터 복원 일부 실패: 원본 EXIF 읽기 실패 ({})", e),
+
+    // DPI 기준 미지정이어도, 원본 헤더(JFIF/pHYs/TIFF IFD/BMP 등)에서 DPI를 읽을 수 있으면 보존한다.
+    let inferred_source_dpi = if set_target_dpi.is_none() {
+        let (sx, sy) = read_dpi_from_file_header(source_path);
+        match (sx, sy) {
+            (Some(x), Some(y)) => Some(((x + y) * 0.5).round().clamp(1.0, 1200.0) as u32),
+            (Some(x), None) => Some(x.round().clamp(1.0, 1200.0) as u32),
+            (None, Some(y)) => Some(y.round().clamp(1.0, 1200.0) as u32),
+            _ => None,
+        }
+    } else {
+        None
     };
+    let effective_target_dpi = set_target_dpi.or(inferred_source_dpi);
+
+    // 원본 EXIF 읽기: 없으면 빈 메타데이터로 시작 (에러 아님)
+    let exif_read_result = LittleExifMetadata::new_from_path(source_path);
+    let no_source_exif = exif_read_result.is_err();
+    let mut metadata = exif_read_result.unwrap_or_else(|_| LittleExifMetadata::new());
 
     // 본문 픽셀은 방향 정규화해서 저장하므로 EXIF Orientation도 1로 맞춘다.
-    metadata.set_tag(LittleExifTag::Orientation(vec![1]));
+    if !no_source_exif {
+        metadata.set_tag(LittleExifTag::Orientation(vec![1]));
+    }
 
     // DPI 기준 최적화 활성 시, 대상 DPI를 명시적으로 고정 저장한다.
-    if let Some(target_dpi) = set_target_dpi {
+    if let Some(target_dpi) = effective_target_dpi {
         let r = LittleExifUR64::from(target_dpi);
         metadata.set_tag(LittleExifTag::XResolution(vec![r.clone()]));
         metadata.set_tag(LittleExifTag::YResolution(vec![r]));
         metadata.set_tag(LittleExifTag::ResolutionUnit(vec![2]));
     }
 
-    if metadata.write_to_file(dest_path).is_ok() {
-        return "메타데이터 복원 완료".to_string();
+    // EXIF가 없었고 DPI도 쓸 게 없으면 메타데이터 복원 자체가 필요 없음
+    if no_source_exif && effective_target_dpi.is_none() {
+        return "메타데이터 복원 생략(원본 EXIF 없음)".to_string();
+    }
+
+    let metadata_write_ok = metadata.write_to_file(dest_path).is_ok();
+    // PNG는 EXIF 기록 성공 여부와 별개로 pHYs(DPI) 보정이 필요하므로 계속 진행한다.
+    if metadata_write_ok && !matches!(detected, Some(RealImageFormat::Png)) {
+        return if no_source_exif {
+            "메타데이터 복원 완료(DPI 신규 기록)".to_string()
+        } else {
+            "메타데이터 복원 완료".to_string()
+        };
     }
 
     // little_exif 실패 시 JPEG/PNG/WebP는 기존 EXIF 복사 방식으로 폴백
@@ -2057,19 +2318,37 @@ fn copy_metadata_best_effort(
             }
         }
         Some(RealImageFormat::Png) => {
-            let src = img_parts::png::Png::from_bytes(Bytes::from(source_bytes));
-            let dst = img_parts::png::Png::from_bytes(Bytes::from(dest_bytes));
-            match (src, dst) {
-                (Ok(src_img), Ok(mut dst_img)) => {
-                    dst_img.set_exif(src_img.exif());
-                    let mut encoded = Vec::new();
-                    dst_img
-                        .encoder()
-                        .write_to(&mut encoded)
-                        .and_then(|_| fs::write(dest_path, encoded))
-                        .map_err(|e| e.to_string())
+            // PNG DPI는 EXIF보다 pHYs 청크가 우선적으로 사용되는 경우가 많다.
+            // 1) target_dpi 지정 시: pHYs를 지정 DPI로 강제
+            // 2) 지정이 없으면: 원본 pHYs를 대상에 복원
+            let desired_phys = if let Some(dpi) = effective_target_dpi {
+                let ppm = ((dpi as f32) / 0.0254).round().max(1.0) as u32;
+                Some((ppm, ppm, 1u8))
+            } else {
+                read_png_phys_chunk(&source_bytes).filter(|(_, _, unit)| *unit == 1)
+            };
+
+            if let Some((xppu, yppu, unit)) = desired_phys {
+                match upsert_png_phys_chunk(&dest_bytes, xppu, yppu, unit) {
+                    Ok(updated) => fs::write(dest_path, updated).map_err(|e| e.to_string()),
+                    Err(e) => Err(e),
                 }
-                (Err(e), _) | (_, Err(e)) => Err(e.to_string()),
+            } else {
+                // pHYs가 없으면 기존 EXIF 복사 폴백 유지
+                let src = img_parts::png::Png::from_bytes(Bytes::from(source_bytes));
+                let dst = img_parts::png::Png::from_bytes(Bytes::from(dest_bytes));
+                match (src, dst) {
+                    (Ok(src_img), Ok(mut dst_img)) => {
+                        dst_img.set_exif(src_img.exif());
+                        let mut encoded = Vec::new();
+                        dst_img
+                            .encoder()
+                            .write_to(&mut encoded)
+                            .and_then(|_| fs::write(dest_path, encoded))
+                            .map_err(|e| e.to_string())
+                    }
+                    (Err(e), _) | (_, Err(e)) => Err(e.to_string()),
+                }
             }
         }
         Some(RealImageFormat::WebP) => {
@@ -2092,6 +2371,7 @@ fn copy_metadata_best_effort(
     };
 
     match fallback_result {
+        Ok(_) if metadata_write_ok => "메타데이터 복원 완료".to_string(),
         Ok(_) => "메타데이터 복원 완료(폴백)".to_string(),
         Err(e) if e.is_empty() => "메타데이터 복원 일부 실패".to_string(),
         Err(e) => format!("메타데이터 복원 일부 실패: {}", e),
@@ -2143,12 +2423,99 @@ fn should_use_gpu_in_auto_mode(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -
     (1.0 - scale).abs() >= AUTO_GPU_MIN_WORK_DELTA
 }
 
+/// Apply a color transform to a resized SlimgImageData and save to dest_path.
+/// `is_jpeg_source`: if true, use mozjpeg grayscale JPEG output; otherwise use PNG for gray/mono.
+/// Returns an error string on failure, or a note string describing the color transform applied.
+/// For Rgb/Rgba modes this function does NOT save the file — caller must use normal convert path.
+fn apply_color_transform_and_save(
+    image: &SlimgImageData,
+    color_mode: ColorMode,
+    dest_path: &Path,
+    is_jpeg_source: bool,
+    encode_quality: u8,
+) -> Result<String, String> {
+    let w = image.width;
+    let h = image.height;
+    let rgba = &image.data;
+
+    match color_mode {
+        ColorMode::Monochrome => {
+            // Threshold to 1-bit B&W, encode as grayscale PNG (Luma8)
+            let luma: Vec<u8> = rgba
+                .chunks_exact(4)
+                .map(|px| {
+                    let gray = (px[0] as u32 * 299 + px[1] as u32 * 587 + px[2] as u32 * 114) / 1000;
+                    if gray >= 128 { 255u8 } else { 0u8 }
+                })
+                .collect();
+            let gray_img = image::GrayImage::from_raw(w, h, luma)
+                .ok_or_else(|| "흑백 이미지 버퍼 생성 실패".to_string())?;
+            gray_img.save_with_format(dest_path, image::ImageFormat::Png)
+                .map_err(|e| format!("흑백 PNG 저장 실패: {}", e))?;
+            Ok("색상변환: Monochrome(→ PNG)".to_string())
+        }
+        ColorMode::Grayscale => {
+            let luma: Vec<u8> = rgba
+                .chunks_exact(4)
+                .map(|px| {
+                    ((px[0] as u32 * 299 + px[1] as u32 * 587 + px[2] as u32 * 114) / 1000) as u8
+                })
+                .collect();
+            if is_jpeg_source {
+                // mozjpeg grayscale JPEG
+                let result = std::panic::catch_unwind(AssertUnwindSafe(|| -> Result<Vec<u8>, String> {
+                    let mut compress = mozjpeg::Compress::new(mozjpeg::ColorSpace::JCS_GRAYSCALE);
+                    compress.set_size(w as usize, h as usize);
+                    compress.set_quality(encode_quality as f32);
+                    compress.set_progressive_mode();
+                    let mut compressor = compress
+                        .start_compress(Vec::new())
+                        .map_err(|e| format!("mozjpeg grayscale 시작 실패: {}", e))?;
+                    compressor
+                        .write_scanlines(&luma)
+                        .map_err(|e| format!("mozjpeg grayscale 쓰기 실패: {}", e))?;
+                    compressor.finish().map_err(|e| format!("mozjpeg grayscale 완료 실패: {}", e))
+                }));
+                let bytes = match result {
+                    Ok(Ok(b)) => b,
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => return Err("mozjpeg grayscale 인코딩 패닉".to_string()),
+                };
+                fs::write(dest_path, &bytes)
+                    .map_err(|e| format!("Grayscale JPEG 저장 실패: {}", e))?;
+                Ok("색상변환: Grayscale(→ JPEG)".to_string())
+            } else {
+                let gray_img = image::GrayImage::from_raw(w, h, luma)
+                    .ok_or_else(|| "Grayscale 이미지 버퍼 생성 실패".to_string())?;
+                gray_img.save_with_format(dest_path, image::ImageFormat::Png)
+                    .map_err(|e| format!("Grayscale PNG 저장 실패: {}", e))?;
+                Ok("색상변환: Grayscale(→ PNG)".to_string())
+            }
+        }
+        ColorMode::Rgb | ColorMode::Rgba => {
+            // No special handling — caller uses normal convert path
+            Ok(String::new())
+        }
+    }
+}
+
 fn run_slimg_resize_with_cancel(
     file: &MigrationTaskFile,
     plan: OptimizationPlan,
     cancel_flag: &AtomicBool,
     criteria: OptimizationCriteria,
     migration_options: MigrationOptions,
+) -> ProcessOutcome {
+    run_slimg_resize_with_cancel_with_decoded(file, plan, cancel_flag, criteria, migration_options, None)
+}
+
+fn run_slimg_resize_with_cancel_with_decoded(
+    file: &MigrationTaskFile,
+    plan: OptimizationPlan,
+    cancel_flag: &AtomicBool,
+    criteria: OptimizationCriteria,
+    migration_options: MigrationOptions,
+    pre_decoded: Option<SlimgImageData>,
 ) -> ProcessOutcome {
     if cancel_flag.load(Ordering::Relaxed) {
         return ProcessOutcome::Cancelled;
@@ -2175,17 +2542,89 @@ fn run_slimg_resize_with_cancel(
         }
 
         let oriented = normalize_dynamic_image_orientation(image, file.orientation);
-        let new_w = ((oriented.width() as f32) * plan.scale).round().max(1.0) as u32;
-        let new_h = ((oriented.height() as f32) * plan.scale).round().max(1.0) as u32;
-        let resized = oriented.resize_exact(new_w, new_h, FilterType::Lanczos3);
-
-        let output = if matches!(real_format, Some(RealImageFormat::Tiff)) {
-            image::ImageFormat::Tiff
+        let (new_w, new_h) = if plan.scale < 1.0 {
+            (
+                ((oriented.width() as f32) * plan.scale).round().max(1.0) as u32,
+                ((oriented.height() as f32) * plan.scale).round().max(1.0) as u32,
+            )
         } else {
-            image::ImageFormat::Bmp
+            (oriented.width(), oriented.height())
+        };
+        let resized = if plan.scale < 1.0 {
+            oriented.resize_exact(new_w, new_h, FilterType::Lanczos3)
+        } else {
+            oriented
         };
 
-        if let Err(e) = resized.save_with_format(&file.dest_path, output) {
+        let is_tiff = matches!(real_format, Some(RealImageFormat::Tiff));
+        let output_fmt = if is_tiff { image::ImageFormat::Tiff } else { image::ImageFormat::Bmp };
+        let fmt_label = if is_tiff { "TIFF" } else { "BMP" };
+
+        // Resolve color transform (lazy if pending)
+        let effective_color_transform = plan.color_transform.or_else(|| {
+            plan.pending_color.and_then(|target| {
+                let rgba_data = resized.to_rgba8();
+                let actual = analyze_color_mode(rgba_data.as_raw(), rgba_data.width(), rgba_data.height());
+                if actual == ColorMode::Monochrome && target == ColorMode::Grayscale {
+                    None
+                } else if actual <= target {
+                    Some(actual.min(target))
+                } else {
+                    None
+                }
+            })
+        });
+
+        // For Mono/Gray: convert to Luma8 and save in original format (TIFF→TIFF, BMP→BMP)
+        if matches!(effective_color_transform, Some(ColorMode::Monochrome) | Some(ColorMode::Grayscale)) {
+            let cm = effective_color_transform.unwrap();
+            let rgba_data = resized.to_rgba8();
+            let w = rgba_data.width();
+            let h = rgba_data.height();
+            let luma: Vec<u8> = rgba_data.pixels().map(|px| {
+                let v = (px[0] as u32 * 299 + px[1] as u32 * 587 + px[2] as u32 * 114) / 1000;
+                if cm == ColorMode::Monochrome { if v >= 128 { 255 } else { 0 } } else { v as u8 }
+            }).collect();
+            let gray_dyn = match image::GrayImage::from_raw(w, h, luma) {
+                Some(img) => image::DynamicImage::ImageLuma8(img),
+                None => return ProcessOutcome::Failed(format!("Grayscale 버퍼 생성 실패: {}", file.relative_path)),
+            };
+            if let Err(e) = gray_dyn.save_with_format(&file.dest_path, output_fmt) {
+                return ProcessOutcome::Failed(format!("색상 변환 저장 실패: {} ({})", file.relative_path, e));
+            }
+            let color_note = if cm == ColorMode::Monochrome {
+                format!("색상변환: Monochrome(→ {})", fmt_label)
+            } else {
+                format!("색상변환: Grayscale(→ {})", fmt_label)
+            };
+            let optimized_size_bytes = fs::metadata(&file.dest_path).map(|m| m.len()).unwrap_or(0);
+            let metadata_message = if migration_options.restore_metadata {
+                copy_metadata_best_effort(&file.source_path, &file.dest_path, if plan.apply_target_dpi { Some(criteria.target_dpi as u32) } else { None })
+            } else { "메타데이터 복원 비활성화".to_string() };
+            if optimized_size_bytes > source_size_bytes {
+                let _ = fs::copy(&file.source_path, &file.dest_path);
+                let restored = fs::metadata(&file.dest_path).map(|m| m.len()).unwrap_or(source_size_bytes);
+                return ProcessOutcome::Success(ProcessSuccess {
+                    action: "skipped", source_size_bytes, dest_size_bytes: restored,
+                    message: "최적화 결과가 원본보다 커서 원본으로 복원 후 스킵 처리".to_string(),
+                    fallback_code: None,
+                });
+            }
+            return ProcessOutcome::Success(ProcessSuccess {
+                action: "optimized", source_size_bytes, dest_size_bytes: optimized_size_bytes,
+                message: format!("{} 최적화 완료(방향 정규화 적용) / {} / {}", fmt_label, metadata_message, color_note),
+                fallback_code: None,
+            });
+        }
+
+        // No color transform (or RGB/RGBA): save in original format
+        let color_note = match effective_color_transform {
+            Some(ColorMode::Rgb) => " / 색상변환: RGB(알파 제거)".to_string(),
+            _ => String::new(),
+        };
+        let final_image = resized;
+
+        if let Err(e) = final_image.save_with_format(&file.dest_path, output_fmt) {
             return ProcessOutcome::Failed(format!(
                 "이미지 저장 실패: {} ({})",
                 file.dest_path.display(),
@@ -2202,9 +2641,7 @@ fn run_slimg_resize_with_cancel(
         } else {
             "메타데이터 복원 비활성화".to_string()
         };
-        let optimized_size_bytes = fs::metadata(&file.dest_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let optimized_size_bytes = fs::metadata(&file.dest_path).map(|m| m.len()).unwrap_or(0);
         if optimized_size_bytes > source_size_bytes {
             if let Err(e) = fs::copy(&file.source_path, &file.dest_path) {
                 return ProcessOutcome::Failed(format!(
@@ -2214,21 +2651,12 @@ fn run_slimg_resize_with_cancel(
                     e
                 ));
             }
-            let restored_size_bytes = fs::metadata(&file.dest_path)
-                .map(|m| m.len())
-                .unwrap_or(source_size_bytes);
+            let restored_size_bytes = fs::metadata(&file.dest_path).map(|m| m.len()).unwrap_or(source_size_bytes);
             return ProcessOutcome::Success(ProcessSuccess {
                 action: "skipped",
                 source_size_bytes,
                 dest_size_bytes: restored_size_bytes,
-                message: format!(
-                    "{} 최적화 결과가 원본보다 커서 원본으로 복원 후 스킵 처리",
-                    if matches!(real_format, Some(RealImageFormat::Tiff)) {
-                        "TIFF"
-                    } else {
-                        "BMP"
-                    }
-                ),
+                message: format!("{} 최적화 결과가 원본보다 커서 원본으로 복원 후 스킵 처리", fmt_label),
                 fallback_code: None,
             });
         }
@@ -2237,9 +2665,7 @@ fn run_slimg_resize_with_cancel(
             action: "optimized",
             source_size_bytes,
             dest_size_bytes: optimized_size_bytes,
-            message: format!("{} 최적화 완료(방향 정규화 적용) / {}",
-              if matches!(real_format, Some(RealImageFormat::Tiff)) { "TIFF" } else { "BMP" },
-              metadata_message),
+            message: format!("{} 최적화 완료(방향 정규화 적용) / {}{}", fmt_label, metadata_message, color_note),
             fallback_code: None,
         });
     }
@@ -2247,13 +2673,26 @@ fn run_slimg_resize_with_cancel(
     let source_size_bytes = fs::metadata(&file.source_path)
         .map(|m| m.len())
         .unwrap_or(0);
-    let (decoded, decoded_format) = match decode_file(&file.source_path) {
-        Ok(value) => value,
-        Err(e) => {
-            return ProcessOutcome::Failed(format!(
-                "slimg-core 디코드 실패: {} ({})",
-                file.relative_path, e
-            ));
+    let (decoded, decoded_format) = if let Some(pre) = pre_decoded {
+        // Use pre-decoded data; we need the format from the file extension
+        let fmt = match file.real_format {
+            RealImageFormat::Jpeg => slimg_core::Format::Jpeg,
+            RealImageFormat::Png => slimg_core::Format::Png,
+            RealImageFormat::WebP => slimg_core::Format::WebP,
+            RealImageFormat::Avif => slimg_core::Format::Avif,
+            RealImageFormat::Qoi => slimg_core::Format::Qoi,
+            _ => slimg_core::Format::Png,
+        };
+        (pre, fmt)
+    } else {
+        match decode_file(&file.source_path) {
+            Ok(value) => value,
+            Err(e) => {
+                return ProcessOutcome::Failed(format!(
+                    "slimg-core 디코드 실패: {} ({})",
+                    file.relative_path, e
+                ));
+            }
         }
     };
 
@@ -2277,90 +2716,160 @@ fn run_slimg_resize_with_cancel(
 
     let pipeline_options = PipelineOptions {
         format: decoded_format,
-        quality: 100,
+        quality: migration_options.encode_quality,
         resize: None,
         crop: None,
         extend: None,
         fill_color: None,
     };
 
-    let new_w = ((normalized.width as f32) * plan.scale).round().max(1.0) as u32;
-    let new_h = ((normalized.height as f32) * plan.scale).round().max(1.0) as u32;
-    let effective_mode = match migration_options.acceleration_mode {
-        AccelerationMode::Cpu => AccelerationMode::Cpu,
-        AccelerationMode::GpuPreferred => AccelerationMode::GpuPreferred,
-        AccelerationMode::Auto => {
-            if get_gpu_resize_context().is_err() {
-                AccelerationMode::Cpu
-            } else if should_use_gpu_in_auto_mode(normalized.width, normalized.height, new_w, new_h) {
-                AccelerationMode::GpuPreferred
-            } else {
-                AccelerationMode::Cpu
+    let (preprocessed, accel_note, accel_fallback_code) = if plan.scale < 1.0 {
+        let new_w = ((normalized.width as f32) * plan.scale).round().max(1.0) as u32;
+        let new_h = ((normalized.height as f32) * plan.scale).round().max(1.0) as u32;
+        // Determine effective mode and reason for Auto
+        let (effective_mode, auto_cpu_reason) = match migration_options.acceleration_mode {
+            AccelerationMode::Cpu => (AccelerationMode::Cpu, None),
+            AccelerationMode::GpuPreferred => (AccelerationMode::GpuPreferred, None),
+            AccelerationMode::Auto => {
+                match get_gpu_resize_context() {
+                    Err(e) => (AccelerationMode::Cpu, Some(format!("GPU 초기화 실패: {}", e))),
+                    Ok(_) => {
+                        let src_px = (normalized.width as u64).saturating_mul(normalized.height as u64);
+                        let dst_px = (new_w as u64).saturating_mul(new_h as u64);
+                        let max_px = src_px.max(dst_px);
+                        let scale_ratio = if src_px > 0 { ((dst_px as f64) / (src_px as f64)).sqrt() as f32 } else { 1.0 };
+                        let delta = (1.0 - scale_ratio).abs();
+                        if should_use_gpu_in_auto_mode(normalized.width, normalized.height, new_w, new_h) {
+                            (AccelerationMode::GpuPreferred, None)
+                        } else if max_px < 2_000_000 {
+                            (AccelerationMode::Cpu, Some(format!("픽셀 수 미달 ({}MP < 2MP)", max_px / 1_000_000)))
+                        } else {
+                            (AccelerationMode::Cpu, Some(format!("scale delta 미달 ({:.1}% < 8%)", delta * 100.0)))
+                        }
+                    }
+                }
             }
-        }
-    };
+        };
 
-    let (preprocessed, accel_note, accel_fallback_code) = match effective_mode {
-        AccelerationMode::Cpu => {
-            match slimg_resize(&normalized, &ResizeMode::Scale(plan.scale as f64)) {
-                Ok(img) => {
-                    let note = if matches!(migration_options.acceleration_mode, AccelerationMode::Auto) {
-                        "가속: Auto->CPU".to_string()
-                    } else {
-                        "가속: CPU".to_string()
-                    };
-                    (img, note, None)
+        match effective_mode {
+            AccelerationMode::Cpu => {
+                match slimg_resize(&normalized, &ResizeMode::Scale(plan.scale as f64)) {
+                    Ok(img) => {
+                        let note = if matches!(migration_options.acceleration_mode, AccelerationMode::Auto) {
+                            match &auto_cpu_reason {
+                                Some(reason) => format!("가속: Auto->CPU ({})", reason),
+                                None => "가속: Auto->CPU".to_string(),
+                            }
+                        } else {
+                            "가속: CPU".to_string()
+                        };
+                        (img, note, None)
+                    }
+                    Err(_) => {
+                        let note = if matches!(migration_options.acceleration_mode, AccelerationMode::Auto) {
+                            "가속: Auto->CPU(리사이즈 실패로 원본 유지)".to_string()
+                        } else {
+                            "가속: CPU(리사이즈 실패로 원본 유지)".to_string()
+                        };
+                        (normalized.clone(), note, None)
+                    }
+                }
+            },
+            _ => match panic::catch_unwind(AssertUnwindSafe(|| {
+                gpu_resize_rgba_wgpu(&normalized.data, normalized.width, normalized.height, new_w, new_h)
+            })) {
+                Ok(Ok(rgba)) => {
+                    let adapter_name = get_gpu_resize_context().ok().map(|c| c.adapter_name.clone()).unwrap_or_default();
+                    (
+                        SlimgImageData::new(new_w, new_h, rgba),
+                        if matches!(migration_options.acceleration_mode, AccelerationMode::Auto) {
+                            format!("가속: Auto->GPU(wgpu) [{}]", adapter_name)
+                        } else {
+                            format!("가속: GPU(wgpu) [{}]", adapter_name)
+                        },
+                        None,
+                    )
+                },
+                Ok(Err(e)) => {
+                    let resized =
+                        slimg_resize(&normalized, &ResizeMode::Scale(plan.scale as f64)).unwrap_or_else(|_| normalized.clone());
+                    (
+                        resized,
+                        if matches!(migration_options.acceleration_mode, AccelerationMode::Auto) {
+                            format!("가속: Auto(GPU) 실패 -> CPU 폴백 ({})", e)
+                        } else {
+                            format!("가속: GPU 실패 -> CPU 폴백 ({})", e)
+                        },
+                        Some(classify_gpu_fallback_code(&e).to_string()),
+                    )
                 }
                 Err(_) => {
-                    let note = if matches!(migration_options.acceleration_mode, AccelerationMode::Auto) {
-                        "가속: Auto->CPU(리사이즈 실패로 원본 유지)".to_string()
-                    } else {
-                        "가속: CPU(리사이즈 실패로 원본 유지)".to_string()
-                    };
-                    (normalized.clone(), note, None)
+                    let resized =
+                        slimg_resize(&normalized, &ResizeMode::Scale(plan.scale as f64)).unwrap_or_else(|_| normalized.clone());
+                    (
+                        resized,
+                        if matches!(migration_options.acceleration_mode, AccelerationMode::Auto) {
+                            "가속: Auto(GPU) 패닉 -> CPU 폴백".to_string()
+                        } else {
+                            "가속: GPU 패닉 -> CPU 폴백".to_string()
+                        },
+                        Some("PANIC".to_string()),
+                    )
                 }
-            }
-        },
-        _ => match panic::catch_unwind(AssertUnwindSafe(|| {
-            gpu_resize_rgba_wgpu(&normalized.data, normalized.width, normalized.height, new_w, new_h)
-        })) {
-            Ok(Ok(rgba)) => (
-                SlimgImageData::new(new_w, new_h, rgba),
-                if matches!(migration_options.acceleration_mode, AccelerationMode::Auto) {
-                    "가속: Auto->GPU(wgpu)".to_string()
-                } else {
-                    "가속: GPU(wgpu)".to_string()
-                },
-                None,
-            ),
-            Ok(Err(e)) => {
-                let resized =
-                    slimg_resize(&normalized, &ResizeMode::Scale(plan.scale as f64)).unwrap_or_else(|_| normalized.clone());
-                (
-                    resized,
-                    if matches!(migration_options.acceleration_mode, AccelerationMode::Auto) {
-                        format!("가속: Auto(GPU) 실패 -> CPU 폴백 ({})", e)
-                    } else {
-                        format!("가속: GPU 실패 -> CPU 폴백 ({})", e)
-                    },
-                    Some(classify_gpu_fallback_code(&e).to_string()),
-                )
-            }
-            Err(_) => {
-                let resized =
-                    slimg_resize(&normalized, &ResizeMode::Scale(plan.scale as f64)).unwrap_or_else(|_| normalized.clone());
-                (
-                    resized,
-                    if matches!(migration_options.acceleration_mode, AccelerationMode::Auto) {
-                        "가속: Auto(GPU) 패닉 -> CPU 폴백".to_string()
-                    } else {
-                        "가속: GPU 패닉 -> CPU 폴백".to_string()
-                    },
-                    Some("PANIC".to_string()),
-                )
-            }
-        },
+            },
+        }
+    } else {
+        // No resize needed — use normalized as-is
+        (normalized, "가속: 리사이즈 없음".to_string(), None)
     };
+
+    // Resolve color transform — either pre-resolved or pending (lazy analysis)
+    let effective_color_transform = plan.color_transform.or_else(|| {
+        plan.pending_color.and_then(|target| {
+            let actual = analyze_color_mode(&preprocessed.data, preprocessed.width, preprocessed.height);
+            if actual == ColorMode::Monochrome && target == ColorMode::Grayscale {
+                None
+            } else if actual <= target {
+                Some(actual.min(target))
+            } else {
+                None
+            }
+        })
+    });
+
+    // Apply color transform if needed
+    if let Some(cm) = effective_color_transform {
+        if cm == ColorMode::Monochrome || cm == ColorMode::Grayscale {
+            let is_jpeg = decoded_format == slimg_core::Format::Jpeg;
+            match apply_color_transform_and_save(&preprocessed, cm, &file.dest_path, is_jpeg, migration_options.encode_quality) {
+                Ok(color_note) => {
+                    if cancel_flag.load(Ordering::Relaxed) {
+                        return ProcessOutcome::Cancelled;
+                    }
+                    let optimized_size_bytes = fs::metadata(&file.dest_path).map(|m| m.len()).unwrap_or(0);
+                    if optimized_size_bytes > source_size_bytes {
+                        let _ = fs::copy(&file.source_path, &file.dest_path);
+                        let restored = fs::metadata(&file.dest_path).map(|m| m.len()).unwrap_or(source_size_bytes);
+                        return ProcessOutcome::Success(ProcessSuccess {
+                            action: "skipped", source_size_bytes, dest_size_bytes: restored,
+                            message: "최적화 결과가 원본보다 커서 원본으로 복원 후 스킵 처리".to_string(),
+                            fallback_code: None,
+                        });
+                    }
+                    let metadata_message = if migration_options.restore_metadata {
+                        copy_metadata_best_effort(&file.source_path, &file.dest_path, if plan.apply_target_dpi { Some(criteria.target_dpi as u32) } else { None })
+                    } else { "메타데이터 복원 비활성화".to_string() };
+                    return ProcessOutcome::Success(ProcessSuccess {
+                        action: "optimized", source_size_bytes, dest_size_bytes: optimized_size_bytes,
+                        message: format!("최적화 완료(방향 정규화 적용) / {} / {} / {}", metadata_message, accel_note, color_note),
+                        fallback_code: accel_fallback_code,
+                    });
+                }
+                Err(e) => return ProcessOutcome::Failed(format!("색상 변환 실패: {} ({})", file.relative_path, e)),
+            }
+        }
+        // For Rgb/Rgba: fall through to normal convert path (slimg-core strips alpha for JPEG automatically)
+    }
 
     let result = match convert(&preprocessed, &pipeline_options) {
         Ok(value) => value,
@@ -2421,11 +2930,14 @@ fn run_slimg_resize_with_cancel(
         "메타데이터 복원 비활성화".to_string()
     };
 
+    let color_suffix = if effective_color_transform.map_or(false, |c| c == ColorMode::Rgb || c == ColorMode::Rgba) {
+        " / 색상변환: RGB(알파 제거)"
+    } else { "" };
     ProcessOutcome::Success(ProcessSuccess {
         action: "optimized",
         source_size_bytes,
         dest_size_bytes: optimized_size_bytes,
-        message: format!("최적화 완료(방향 정규화 적용) / {} / {}", metadata_message, accel_note),
+        message: format!("최적화 완료(방향 정규화 적용) / {} / {}{}", metadata_message, accel_note, color_suffix),
         fallback_code: accel_fallback_code,
     })
 }
@@ -2468,8 +2980,63 @@ fn process_single_migration_file(
 
     let source_size_bytes = fs::metadata(&file.source_path).map(|m| m.len()).unwrap_or(0);
 
-    if let Some(plan) = compute_required_scale(file, criteria) {
-        return run_slimg_resize_with_cancel(file, plan, cancel_flag, criteria, options);
+    // Policy: palette 1-bit sources are excluded from color transform.
+    // Resize/quality optimization still applies via normal pipeline.
+    let mut effective_criteria = criteria;
+    if criteria.color.enabled && is_palette_1bit_source(&file.source_path) {
+        effective_criteria.color.enabled = false;
+    }
+
+    // Quick plan check (without pixel data) to see if scale is needed.
+    // For color criteria, we need decoded pixels, so we decode lazily below.
+    let quick_plan = compute_optimization_plan(file, effective_criteria, None);
+
+    // If color criteria enabled, we need to decode to get actual color mode.
+    // Decode here if we haven't already (i.e., no scale was needed but color might be).
+    if effective_criteria.color.enabled {
+        // For BMP/TIFF use dynamic image path; for others use slimg-core.
+        let is_bmp_tiff = matches!(file.real_format, RealImageFormat::Bmp | RealImageFormat::Tiff);
+        if !is_bmp_tiff {
+            let decode_result = decode_file(&file.source_path);
+            match decode_result {
+                Ok((decoded, _)) => {
+                    // Re-compute plan with real pixel data
+                    let refined_plan = compute_optimization_plan(file, effective_criteria, Some(&decoded.data));
+                    if let Some(plan) = refined_plan {
+                        return run_slimg_resize_with_cancel_with_decoded(
+                            file, plan, cancel_flag, effective_criteria, options, Some(decoded),
+                        );
+                    }
+                    // No optimization needed even with color info
+                    if cancel_flag.load(Ordering::Relaxed) {
+                        return ProcessOutcome::Cancelled;
+                    }
+                    if let Err(e) = fs::copy(&file.source_path, &file.dest_path) {
+                        return ProcessOutcome::Failed(format!(
+                            "파일 복사 실패: {} -> {} ({})",
+                            file.source_path.display(),
+                            file.dest_path.display(),
+                            e
+                        ));
+                    }
+                    let dest_size_bytes = fs::metadata(&file.dest_path).map(|m| m.len()).unwrap_or(0);
+                    return ProcessOutcome::Success(ProcessSuccess {
+                        action: "skipped",
+                        source_size_bytes,
+                        dest_size_bytes,
+                        message: "기준 미초과로 복사 처리".to_string(),
+                        fallback_code: None,
+                    });
+                }
+                Err(_) => {
+                    // Decode failed; fall through to quick_plan path below
+                }
+            }
+        }
+    }
+
+    if let Some(plan) = quick_plan {
+        return run_slimg_resize_with_cancel(file, plan, cancel_flag, effective_criteria, options);
     }
 
     if cancel_flag.load(Ordering::Relaxed) {
@@ -2528,7 +3095,8 @@ fn run_migration_sync(
     options: MigrationOptions,
 ) -> Result<(), String> {
     let source_base = PathBuf::from(source_path);
-    let dest_base = PathBuf::from(dest_path);
+    // Windows에서 슬래시/백슬래시 혼용 방지: 슬래시를 백슬래시로 정규화
+    let dest_base = PathBuf::from(dest_path.replace('/', std::path::MAIN_SEPARATOR_STR));
 
     if !source_base.exists() || !source_base.is_dir() {
         return Err(format!("유효한 원본 폴더가 아닙니다: {}", source_base.display()));
@@ -2834,7 +3402,16 @@ async fn start_migration(
     max_height: Option<u32>,
     restore_metadata: Option<bool>,
     acceleration_mode: Option<AccelerationModeArg>,
+    use_color: Option<bool>,
+    target_color_mode: Option<String>,
+    encode_quality: Option<u8>,
 ) -> Result<(), String> {
+    let color_mode = match target_color_mode.as_deref().unwrap_or("rgba") {
+        "monochrome" => ColorMode::Monochrome,
+        "grayscale" => ColorMode::Grayscale,
+        "rgb" => ColorMode::Rgb,
+        _ => ColorMode::Rgba,
+    };
     let criteria = OptimizationCriteria {
         use_dpi: use_dpi.unwrap_or(true),
         target_dpi: target_dpi.unwrap_or(300).clamp(72, 1200) as f32,
@@ -2842,9 +3419,13 @@ async fn start_migration(
         max_width: max_width.unwrap_or(4000).clamp(64, 20000),
         use_max_height: use_max_height.unwrap_or(false),
         max_height: max_height.unwrap_or(4000).clamp(64, 20000),
+        color: ColorCriteria {
+            enabled: use_color.unwrap_or(false),
+            target_mode: color_mode,
+        },
     };
 
-    if !criteria.use_dpi && !criteria.use_max_width && !criteria.use_max_height {
+    if !criteria.use_dpi && !criteria.use_max_width && !criteria.use_max_height && !criteria.color.enabled {
         return Err("최적화 기준을 하나 이상 선택하세요.".to_string());
     }
 
@@ -2853,6 +3434,7 @@ async fn start_migration(
         acceleration_mode: acceleration_mode
             .map(AccelerationMode::from)
             .unwrap_or(AccelerationMode::Auto),
+        encode_quality: encode_quality.unwrap_or(100).clamp(1, 100),
     };
 
     let cancel_flag = {
