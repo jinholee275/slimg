@@ -156,9 +156,8 @@ const cardHeight = ref(600);
 const splitRatioInCard = ref(50);
 const useDpiCriteria = ref(true);
 const targetDpi = ref(300);
-const useMaxWidthCriteria = ref(false);
+const useMaxResolutionCriteria = ref(false);
 const maxWidthPx = ref(4000);
-const useMaxHeightCriteria = ref(false);
 const maxHeightPx = ref(4000);
 const restoreMetadata = ref(true);
 const accelerationMode = ref<AccelerationMode>('auto');
@@ -995,9 +994,9 @@ async function startMigration() {
       concurrencyLimit: selectedConcurrency.value,
       useDpi: useDpiCriteria.value,
       targetDpi: targetDpi.value,
-      useMaxWidth: useMaxWidthCriteria.value,
+      useMaxWidth: useMaxResolutionCriteria.value,
       maxWidth: maxWidthPx.value,
-      useMaxHeight: useMaxHeightCriteria.value,
+      useMaxHeight: useMaxResolutionCriteria.value,
       maxHeight: maxHeightPx.value,
       restoreMetadata: restoreMetadata.value,
       accelerationMode: accelerationMode.value,
@@ -1339,17 +1338,9 @@ function stopMigrationClock() {
 }
 
 function applyResolutionPreset(width: number, height: number) {
-  useMaxWidthCriteria.value = true;
-  useMaxHeightCriteria.value = true;
+  useMaxResolutionCriteria.value = true;
   maxWidthPx.value = width;
   maxHeightPx.value = height;
-}
-
-function swapMaxResolutionValues() {
-  const nextWidth = clampRangeValue(maxHeightPx.value, 256, 12000);
-  const nextHeight = clampRangeValue(maxWidthPx.value, 256, 12000);
-  maxWidthPx.value = nextWidth;
-  maxHeightPx.value = nextHeight;
 }
 
 function clampRangeValue(value: number, min: number, max: number): number {
@@ -1361,13 +1352,7 @@ function onTargetDpiInputChange() {
   targetDpi.value = clampRangeValue(targetDpi.value, 72, 1200);
 }
 
-function onMaxWidthInputChange() {
-  maxWidthPx.value = clampRangeValue(maxWidthPx.value, 256, 12000);
-}
-
-function onMaxHeightInputChange() {
-  maxHeightPx.value = clampRangeValue(maxHeightPx.value, 256, 12000);
-}
+const maxResolutionText = computed(() => `${maxWidthPx.value}x${maxHeightPx.value}`);
 
 function formatDuration(totalSeconds: number): string {
   const sec = Math.max(0, Math.round(totalSeconds));
@@ -1644,69 +1629,32 @@ const avgPerFileText = computed(() => (avgPerFileSeconds.value == null ? '-' : f
                 <span class="number-input-unit">DPI</span>
               </div>
             </div>
-            <div class="preset-buttons">
-              <button class="preset-button" @click="applyResolutionPreset(640, 480)">VGA</button>
-              <button class="preset-button" @click="applyResolutionPreset(1024, 768)">XGA</button>
-              <button class="preset-button" @click="applyResolutionPreset(1280, 720)">HD</button>
-              <button class="preset-button" @click="applyResolutionPreset(1920, 1080)">FHD</button>
-              <button class="preset-button" @click="applyResolutionPreset(2560, 1440)">QHD</button>
-              <button class="preset-button" @click="applyResolutionPreset(3840, 2160)">4K</button>
-            </div>
           </div>
           <div class="toolbar-line">
             <div class="toolbar-slider">
               <label class="criteria-toggle">
-                <input v-model="useMaxWidthCriteria" type="checkbox" />
-                <span>최대 가로</span>
+                <input v-model="useMaxResolutionCriteria" type="checkbox" />
+                <span>최대 해상도</span>
               </label>
               <input
-                v-model.number="maxWidthPx"
-                type="range"
-                min="256"
-                max="12000"
-                step="8"
-                :disabled="!useMaxWidthCriteria"
+                class="range-number-input max-resolution-text"
+                type="text"
+                :value="maxResolutionText"
+                readonly
+                :disabled="!useMaxResolutionCriteria"
               />
-              <div class="number-input-wrap">
-                <input
-                  v-model.number="maxWidthPx"
-                  class="range-number-input"
-                  type="number"
-                  min="256"
-                  max="12000"
-                  step="1"
-                  :disabled="!useMaxWidthCriteria"
-                  @change="onMaxWidthInputChange"
-                />
-                <span class="number-input-unit">px</span>
-              </div>
-              <button class="preset-button swap-button" @click="swapMaxResolutionValues">⇄</button>
-            </div>
-            <div class="toolbar-slider">
-              <label class="criteria-toggle">
-                <input v-model="useMaxHeightCriteria" type="checkbox" />
-                <span>최대 세로</span>
-              </label>
-              <input
-                v-model.number="maxHeightPx"
-                type="range"
-                min="256"
-                max="12000"
-                step="8"
-                :disabled="!useMaxHeightCriteria"
-              />
-              <div class="number-input-wrap">
-                <input
-                  v-model.number="maxHeightPx"
-                  class="range-number-input"
-                  type="number"
-                  min="256"
-                  max="12000"
-                  step="1"
-                  :disabled="!useMaxHeightCriteria"
-                  @change="onMaxHeightInputChange"
-                />
-                <span class="number-input-unit">px</span>
+              <div class="preset-buttons">
+                <button class="preset-button" @click="applyResolutionPreset(640, 480)">VGA</button>
+                <button class="preset-button" @click="applyResolutionPreset(1024, 768)">XGA</button>
+                <button class="preset-button" @click="applyResolutionPreset(1280, 960)">SXGA</button>
+                <button class="preset-button" @click="applyResolutionPreset(1600, 1200)">UXGA</button>
+                <button class="preset-button" @click="applyResolutionPreset(2048, 1536)">QXGA</button>
+                <button class="preset-button" @click="applyResolutionPreset(3200, 2400)">QUXGA</button>
+                <button class="preset-button" @click="applyResolutionPreset(4096, 3072)">4K 4:3</button>
+                <button class="preset-button" @click="applyResolutionPreset(1280, 720)">HD</button>
+                <button class="preset-button" @click="applyResolutionPreset(1920, 1080)">FHD</button>
+                <button class="preset-button" @click="applyResolutionPreset(2560, 1440)">QHD</button>
+                <button class="preset-button" @click="applyResolutionPreset(3840, 2160)">4K</button>
               </div>
             </div>
           </div>
@@ -2176,9 +2124,10 @@ body,
   border-color: #5a5a5a;
 }
 
-.swap-button {
-  padding: 3px 6px;
-  flex-shrink: 0;
+.max-resolution-text {
+  width: 110px;
+  text-align: center;
+  letter-spacing: 0.4px;
 }
 
 .color-criteria-row {

@@ -2130,18 +2130,26 @@ fn compute_optimization_plan(file: &MigrationTaskFile, criteria: OptimizationCri
         }
     }
 
+    // Max resolution is orientation-aware:
+    // landscape image -> use configured (max_width, max_height)
+    // portrait image  -> swap configured values
+    let (effective_max_width, effective_max_height) = match (file.width, file.height) {
+        (Some(w), Some(h)) if w < h => (criteria.max_height, criteria.max_width),
+        _ => (criteria.max_width, criteria.max_height),
+    };
+
     if criteria.use_max_width {
         if let Some(width) = file.width {
-            if width > criteria.max_width {
-                required_scales.push(criteria.max_width as f32 / width as f32);
+            if width > effective_max_width {
+                required_scales.push(effective_max_width as f32 / width as f32);
             }
         }
     }
 
     if criteria.use_max_height {
         if let Some(height) = file.height {
-            if height > criteria.max_height {
-                required_scales.push(criteria.max_height as f32 / height as f32);
+            if height > effective_max_height {
+                required_scales.push(effective_max_height as f32 / height as f32);
             }
         }
     }
