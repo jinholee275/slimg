@@ -2138,18 +2138,31 @@ fn compute_optimization_plan(file: &MigrationTaskFile, criteria: OptimizationCri
         _ => (criteria.max_width, criteria.max_height),
     };
 
-    if criteria.use_max_width {
-        if let Some(width) = file.width {
-            if width > effective_max_width {
-                required_scales.push(effective_max_width as f32 / width as f32);
+    if criteria.use_max_width && criteria.use_max_height {
+        // Combined max-resolution mode: use short-side threshold only.
+        // If source short side is already <= target short side, skip resize.
+        if let (Some(width), Some(height)) = (file.width, file.height) {
+            let source_short = width.min(height);
+            let target_short = effective_max_width.min(effective_max_height);
+            if source_short > target_short {
+                required_scales.push(target_short as f32 / source_short as f32);
             }
         }
-    }
+    } else {
+        // Backward-compatible path when only one criterion is enabled.
+        if criteria.use_max_width {
+            if let Some(width) = file.width {
+                if width > effective_max_width {
+                    required_scales.push(effective_max_width as f32 / width as f32);
+                }
+            }
+        }
 
-    if criteria.use_max_height {
-        if let Some(height) = file.height {
-            if height > effective_max_height {
-                required_scales.push(effective_max_height as f32 / height as f32);
+        if criteria.use_max_height {
+            if let Some(height) = file.height {
+                if height > effective_max_height {
+                    required_scales.push(effective_max_height as f32 / height as f32);
+                }
             }
         }
     }
