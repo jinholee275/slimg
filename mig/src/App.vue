@@ -1351,6 +1351,10 @@ function clampRangeValue(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, Math.round(value)));
 }
 
+function onTargetDpiInputChange() {
+  targetDpi.value = clampRangeValue(targetDpi.value, 72, 1200);
+}
+
 function onMaxWidthInputChange() {
   maxWidthPx.value = clampRangeValue(maxWidthPx.value, 256, 12000);
 }
@@ -1542,7 +1546,7 @@ const avgPerFileText = computed(() => (avgPerFileSeconds.value == null ? '-' : f
 
     <main class="main-content">
       <section class="second-toolbar-row">
-        <div class="toolbar-sliders two-lines">
+        <div class="toolbar-sliders three-lines">
           <div class="toolbar-line">
             <div class="toolbar-slider">
               <label for="card-height-range">카드 높이</label>
@@ -1597,8 +1601,30 @@ const avgPerFileText = computed(() => (avgPerFileSeconds.value == null ? '-' : f
                 step="1"
                 :disabled="!useDpiCriteria"
               />
-              <span>{{ targetDpi }} DPI</span>
+              <div class="number-input-wrap">
+                <input
+                  v-model.number="targetDpi"
+                  class="range-number-input"
+                  type="number"
+                  min="72"
+                  max="1200"
+                  step="1"
+                  :disabled="!useDpiCriteria"
+                  @change="onTargetDpiInputChange"
+                />
+                <span class="number-input-unit">DPI</span>
+              </div>
             </div>
+            <div class="preset-buttons">
+              <button class="preset-button" @click="applyResolutionPreset(640, 480)">VGA</button>
+              <button class="preset-button" @click="applyResolutionPreset(1024, 768)">XGA</button>
+              <button class="preset-button" @click="applyResolutionPreset(1280, 720)">HD</button>
+              <button class="preset-button" @click="applyResolutionPreset(1920, 1080)">FHD</button>
+              <button class="preset-button" @click="applyResolutionPreset(2560, 1440)">QHD</button>
+              <button class="preset-button" @click="applyResolutionPreset(3840, 2160)">4K</button>
+            </div>
+          </div>
+          <div class="toolbar-line">
             <div class="toolbar-slider">
               <label class="criteria-toggle">
                 <input v-model="useMaxWidthCriteria" type="checkbox" />
@@ -1612,17 +1638,20 @@ const avgPerFileText = computed(() => (avgPerFileSeconds.value == null ? '-' : f
                 step="8"
                 :disabled="!useMaxWidthCriteria"
               />
-              <input
-                v-model.number="maxWidthPx"
-                class="range-number-input"
-                type="number"
-                min="256"
-                max="12000"
-                step="1"
-                :disabled="!useMaxWidthCriteria"
-                @change="onMaxWidthInputChange"
-              />
-              <span>{{ maxWidthPx }} px</span>
+              <div class="number-input-wrap">
+                <input
+                  v-model.number="maxWidthPx"
+                  class="range-number-input"
+                  type="number"
+                  min="256"
+                  max="12000"
+                  step="1"
+                  :disabled="!useMaxWidthCriteria"
+                  @change="onMaxWidthInputChange"
+                />
+                <span class="number-input-unit">px</span>
+              </div>
+              <button class="preset-button swap-button" @click="swapMaxResolutionValues">⇄</button>
             </div>
             <div class="toolbar-slider">
               <label class="criteria-toggle">
@@ -1637,24 +1666,19 @@ const avgPerFileText = computed(() => (avgPerFileSeconds.value == null ? '-' : f
                 step="8"
                 :disabled="!useMaxHeightCriteria"
               />
-              <input
-                v-model.number="maxHeightPx"
-                class="range-number-input"
-                type="number"
-                min="256"
-                max="12000"
-                step="1"
-                :disabled="!useMaxHeightCriteria"
-                @change="onMaxHeightInputChange"
-              />
-              <span>{{ maxHeightPx }} px</span>
-            </div>
-            <div class="preset-buttons">
-              <button class="preset-button" @click="swapMaxResolutionValues">가로↔세로</button>
-              <button class="preset-button" @click="applyResolutionPreset(1280, 720)">HD</button>
-              <button class="preset-button" @click="applyResolutionPreset(1920, 1080)">FHD</button>
-              <button class="preset-button" @click="applyResolutionPreset(2560, 1440)">QHD</button>
-              <button class="preset-button" @click="applyResolutionPreset(3840, 2160)">4K</button>
+              <div class="number-input-wrap">
+                <input
+                  v-model.number="maxHeightPx"
+                  class="range-number-input"
+                  type="number"
+                  min="256"
+                  max="12000"
+                  step="1"
+                  :disabled="!useMaxHeightCriteria"
+                  @change="onMaxHeightInputChange"
+                />
+                <span class="number-input-unit">px</span>
+              </div>
             </div>
           </div>
         </div>
@@ -2066,7 +2090,8 @@ body,
   flex-wrap: wrap;
 }
 
-.toolbar-sliders.two-lines {
+.toolbar-sliders.two-lines,
+.toolbar-sliders.three-lines {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
@@ -2092,6 +2117,11 @@ body,
   font-size: 12px;
   background-color: #3a3a3a;
   border-color: #5a5a5a;
+}
+
+.swap-button {
+  padding: 3px 6px;
+  flex-shrink: 0;
 }
 
 .criteria-toggle {
@@ -2123,14 +2153,30 @@ body,
   border-radius: 4px;
 }
 
+.number-input-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.number-input-unit {
+  position: absolute;
+  right: 6px;
+  font-size: 11px;
+  color: #888;
+  pointer-events: none;
+  user-select: none;
+}
+
 .range-number-input {
-  width: 88px;
-  padding: 2px 6px;
+  width: 62px;
+  padding: 2px 22px 2px 6px;
   font-size: 12px;
   color: #ddd;
   background: #2a2a2a;
   border: 1px solid #505050;
   border-radius: 4px;
+  text-align: right;
 }
 
 .toolbar-actions {
