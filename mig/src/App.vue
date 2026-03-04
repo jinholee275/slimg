@@ -2820,8 +2820,11 @@ body,
   position: absolute;
   top: 0;
   bottom: 0;
-  width: 0;
-  border-left: 2px solid rgba(255, 255, 255, 0.75);
+  width: 2px;
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow:
+    -1px 0 0 rgba(0, 0, 0, 0.85),
+     1px 0 0 rgba(0, 0, 0, 0.85);
   transform: translateX(-1px);
   cursor: ew-resize;
   z-index: 2;
