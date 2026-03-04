@@ -976,6 +976,263 @@ fn try_fix_tiff_lsb_fill_order(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(result)
 }
 
+/// TIFF IFD에서 PhotometricInterpretation 값만 빠르게 읽어 Palette(3) 여부 반환.
+/// 파일을 전부 읽지 않고 magic prefix만으로 판별한다.
+fn is_palette_tiff(bytes: &[u8]) -> bool {
+    if bytes.len() < 8 { return false; }
+    let le = match &bytes[0..2] { b"II" => true, b"MM" => false, _ => return false };
+    let r16 = |o: usize| -> u16 {
+        let s = match bytes.get(o..o+2) { Some(s) => s, None => return 0 };
+        if le { u16::from_le_bytes([s[0],s[1]]) } else { u16::from_be_bytes([s[0],s[1]]) }
+    };
+    let r32 = |o: usize| -> u32 {
+        let s = match bytes.get(o..o+4) { Some(s) => s, None => return 0 };
+        if le { u32::from_le_bytes([s[0],s[1],s[2],s[3]]) } else { u32::from_be_bytes([s[0],s[1],s[2],s[3]]) }
+    };
+    if r16(2) != 42 { return false; }
+    let ifd = r32(4) as usize;
+    let n = r16(ifd) as usize;
+    for i in 0..n {
+        let e = ifd + 2 + i * 12;
+        if r16(e) == 262 { // PhotometricInterpretation
+            let ftype = r16(e + 2);
+            let voff = e + 8;
+            let val = if ftype == 3 { r16(voff) as u32 } else { r32(voff) };
+            return val == 3;
+        }
+    }
+    false
+}
+
+/// Palette/Indexed color TIFF (PhotometricInterpretation=3)를 수동으로 디코딩하여 RGB DynamicImage로 변환.
+/// `image`/`tiff` crate가 RGBPalette를 지원하지 않으므로 TIFF IFD를 직접 파싱하고
+/// weezl로 LZW 압축을 해제한 뒤 ColorMap으로 RGB 변환한다.
+/// `max_size`: Some(n)이면 인덱스 버퍼를 n px 이내로 다운샘플 후 변환 (썸네일용 고속 경로).
+fn try_decode_palette_tiff(bytes: &[u8]) -> Option<image::DynamicImage> {
+    try_decode_palette_tiff_inner(bytes, None)
+}
+
+fn try_decode_palette_tiff_inner(bytes: &[u8], max_size: Option<u32>) -> Option<image::DynamicImage> {
+    // ── TIFF 헤더 ──────────────────────────────────────────────────────────
+    if bytes.len() < 8 { return None; }
+    let little_endian = match &bytes[0..2] {
+        b"II" => true,
+        b"MM" => false,
+        _ => return None,
+    };
+
+    let read_u16 = |off: usize| -> Option<u16> {
+        let s = bytes.get(off..off+2)?;
+        Some(if little_endian {
+            u16::from_le_bytes([s[0], s[1]])
+        } else {
+            u16::from_be_bytes([s[0], s[1]])
+        })
+    };
+    let read_u32 = |off: usize| -> Option<u32> {
+        let s = bytes.get(off..off+4)?;
+        Some(if little_endian {
+            u32::from_le_bytes([s[0], s[1], s[2], s[3]])
+        } else {
+            u32::from_be_bytes([s[0], s[1], s[2], s[3]])
+        })
+    };
+
+    // magic
+    if read_u16(2)? != 42 { return None; }
+    let ifd_offset = read_u32(4)? as usize;
+
+    // ── IFD 파싱 ──────────────────────────────────────────────────────────
+    let num_entries = read_u16(ifd_offset)? as usize;
+
+    let mut width: u32 = 0;
+    let mut height: u32 = 0;
+    let mut bits_per_sample: u16 = 8;
+    let mut compression: u16 = 1;
+    let mut photometric: u16 = 0;
+    let mut strip_offsets: Vec<u32> = Vec::new();
+    let mut strip_byte_counts: Vec<u32> = Vec::new();
+    let mut rows_per_strip: u32 = u32::MAX;
+    let mut colormap_offset: usize = 0;
+    let mut colormap_count: usize = 0;
+    let mut predictor: u16 = 1;
+
+    for i in 0..num_entries {
+        let entry_off = ifd_offset + 2 + i * 12;
+        let tag   = read_u16(entry_off)?;
+        let ftype = read_u16(entry_off + 2)?;
+        let count = read_u32(entry_off + 4)? as usize;
+        let voff  = entry_off + 8;
+
+        // value_or_offset: count*typesize <= 4 이면 value 자체, 아니면 offset
+        let type_size: usize = match ftype { 1|2|6|7 => 1, 3|8 => 2, 4|9|11 => 4, 5|10|12 => 8, _ => 1 };
+        let inline = count * type_size <= 4;
+
+        let read_u16_val = |idx: usize| -> Option<u16> {
+            if inline {
+                read_u16(voff + idx * 2)
+            } else {
+                let base = read_u32(voff)? as usize;
+                read_u16(base + idx * 2)
+            }
+        };
+        let read_u32_val = |idx: usize| -> Option<u32> {
+            if inline {
+                // SHORT(3)가 인라인이면 u16 -> u32
+                if ftype == 3 { Some(read_u16(voff + idx * 2)? as u32) }
+                else { read_u32(voff + idx * 4) }
+            } else {
+                let base = read_u32(voff)? as usize;
+                if ftype == 3 { Some(read_u16(base + idx * 2)? as u32) }
+                else { read_u32(base + idx * 4) }
+            }
+        };
+
+        match tag {
+            256 => width        = read_u32_val(0)?,
+            257 => height       = read_u32_val(0)?,
+            258 => bits_per_sample = read_u16_val(0)?,
+            259 => compression  = read_u16_val(0)?,
+            262 => photometric  = read_u16_val(0)?,
+            273 => { // StripOffsets
+                for j in 0..count { strip_offsets.push(read_u32_val(j)?); }
+            }
+            278 => rows_per_strip = read_u32_val(0)?,
+            317 => predictor = read_u16_val(0)?,
+            279 => { // StripByteCounts
+                for j in 0..count { strip_byte_counts.push(read_u32_val(j)?); }
+            }
+            320 => { // ColorMap
+                colormap_count = count;
+                colormap_offset = if inline { voff } else { read_u32(voff)? as usize };
+            }
+            _ => {}
+        }
+    }
+
+    // Palette TIFF 조건 검증
+    if photometric != 3 { return None; }                // RGBPalette만 처리
+    if bits_per_sample != 8 { return None; }            // 8비트 인덱스만 지원
+    if width == 0 || height == 0 { return None; }
+    if colormap_count == 0 || colormap_count % 3 != 0 { return None; }
+    if strip_offsets.is_empty() || strip_offsets.len() != strip_byte_counts.len() { return None; }
+
+    // ── ColorMap 읽기 ──────────────────────────────────────────────────────
+    // ColorMap은 SHORT(u16) 배열: R[0..n], G[0..n], B[0..n]
+    let palette_size = colormap_count / 3;
+    let mut colormap = vec![0u16; colormap_count];
+    for i in 0..colormap_count {
+        colormap[i] = read_u16(colormap_offset + i * 2)?;
+    }
+
+    // ── 각 Strip 디코딩 ────────────────────────────────────────────────────
+    let expected_pixels = (width * height) as usize;
+    let mut indices: Vec<u8> = Vec::with_capacity(expected_pixels);
+
+    for (strip_idx, (&offset, &byte_count)) in strip_offsets.iter().zip(&strip_byte_counts).enumerate() {
+        let start = offset as usize;
+        let end   = start + byte_count as usize;
+        let compressed = bytes.get(start..end)?;
+
+        match compression {
+            1 => {
+                // No compression — そのままコピー
+                indices.extend_from_slice(compressed);
+            }
+            5 => {
+                // TIFF LZW: with_tiff_size_switch 필수 (early change 방식)
+                use weezl::{BitOrder, decode::Decoder as LzwDecoder};
+                let decoded = LzwDecoder::with_tiff_size_switch(BitOrder::Msb, 8)
+                    .decode(compressed)
+                    .ok()?;
+                indices.extend_from_slice(&decoded);
+            }
+            32773 => {
+                // PackBits
+                let mut i = 0usize;
+                while i < compressed.len() {
+                    let n = compressed[i] as i8;
+                    i += 1;
+                    if n >= 0 {
+                        let run = (n as usize) + 1;
+                        let src = compressed.get(i..i+run)?;
+                        indices.extend_from_slice(src);
+                        i += run;
+                    } else if n != -128 {
+                        let repeat = (-n as usize) + 1;
+                        let byte = *compressed.get(i)?;
+                        i += 1;
+                        indices.extend(std::iter::repeat(byte).take(repeat));
+                    }
+                }
+            }
+            _ => return None,
+        }
+    }
+
+    // ── Predictor=2 (Horizontal differencing) 역변환 ──────────────────────
+    // LZW 압축 전에 수평 차분이 적용된 경우, 각 행의 누적합으로 원래 인덱스 복원
+    if predictor == 2 {
+        let w = width as usize;
+        for row in indices.chunks_mut(w) {
+            for x in 1..row.len() {
+                row[x] = row[x].wrapping_add(row[x - 1]);
+            }
+        }
+    }
+
+    // ── 인덱스 → RGB 변환 ─────────────────────────────────────────────────
+    indices.truncate(expected_pixels);
+    if indices.len() < expected_pixels { return None; }
+
+    let r_base = 0;
+    let g_base = palette_size;
+    let b_base = palette_size * 2;
+
+    // 팔레트를 8비트 RGB LUT로 미리 변환 (colormap[i]>>8)
+    let lut: Vec<[u8; 3]> = (0..palette_size).map(|p| [
+        (colormap[r_base + p] >> 8) as u8,
+        (colormap[g_base + p] >> 8) as u8,
+        (colormap[b_base + p] >> 8) as u8,
+    ]).collect();
+
+    // max_size가 지정된 경우 인덱스 버퍼를 먼저 다운샘플 후 변환 (풀 RGB 버퍼 생략)
+    if let Some(max_px) = max_size {
+        let scale = (max_px as f32 / width.max(height) as f32).min(1.0);
+        if scale < 1.0 {
+            let out_w = ((width as f32 * scale).round() as u32).max(1);
+            let out_h = ((height as f32 * scale).round() as u32).max(1);
+            let mut rgb = vec![0u8; (out_w * out_h) as usize * 3];
+            for dy in 0..out_h {
+                let sy = ((dy as f32 + 0.5) / out_h as f32 * height as f32) as usize;
+                let sy = sy.min(height as usize - 1);
+                for dx in 0..out_w {
+                    let sx = ((dx as f32 + 0.5) / out_w as f32 * width as f32) as usize;
+                    let sx = sx.min(width as usize - 1);
+                    let idx = indices[sy * width as usize + sx] as usize;
+                    let dst = (dy * out_w + dx) as usize * 3;
+                    let c = if idx < palette_size { lut[idx] } else { [0,0,0] };
+                    rgb[dst] = c[0]; rgb[dst+1] = c[1]; rgb[dst+2] = c[2];
+                }
+            }
+            return image::RgbImage::from_raw(out_w, out_h, rgb)
+                .map(image::DynamicImage::ImageRgb8);
+        }
+    }
+
+    // 풀 해상도 변환
+    let mut rgb = vec![0u8; expected_pixels * 3];
+    for (i, &idx) in indices.iter().enumerate() {
+        let p = idx as usize;
+        let dst = i * 3;
+        let c = if p < palette_size { lut[p] } else { [0,0,0] };
+        rgb[dst] = c[0]; rgb[dst+1] = c[1]; rgb[dst+2] = c[2];
+    }
+
+    image::RgbImage::from_raw(width, height, rgb)
+        .map(image::DynamicImage::ImageRgb8)
+}
+
 fn load_image_with_fallback(path: &Path) -> Result<image::DynamicImage, String> {
     let bytes = fs::read(path)
         .map_err(|e| format!("파일 읽기 실패: {} ({})", path.display(), e))?;
@@ -996,6 +1253,11 @@ fn load_image_with_fallback(path: &Path) -> Result<image::DynamicImage, String> 
         if let Ok(img) = image::load_from_memory(&fixed) {
             return Ok(img);
         }
+    }
+
+    // TIFF Palette/Indexed color (PhotometricInterpretation=3) 전용 폴백
+    if let Some(img) = try_decode_palette_tiff(&bytes) {
+        return Ok(img);
     }
 
     Err(format!("이미지 디코드 실패: {}", path.display()))
@@ -1310,45 +1572,53 @@ fn gpu_resize_rgba_wgpu(
     Ok(out)
 }
 
-fn guess_mime_from_path(path: &Path) -> &'static str {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .unwrap_or_default();
-
-    match ext.as_str() {
-        "jpg" | "jpeg" => "image/jpeg",
-        "png" => "image/png",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "bmp" => "image/bmp",
-        "tif" | "tiff" => "image/tiff",
-        _ => "application/octet-stream",
+fn guess_mime_from_real_format(format: RealImageFormat) -> &'static str {
+    match format {
+        RealImageFormat::Jpeg => "image/jpeg",
+        RealImageFormat::Png => "image/png",
+        RealImageFormat::WebP => "image/webp",
+        RealImageFormat::Gif => "image/gif",
+        RealImageFormat::Bmp => "image/bmp",
+        RealImageFormat::Tiff => "image/tiff",
+        RealImageFormat::Avif => "image/avif",
+        RealImageFormat::HeicLike => "image/heic",
+        RealImageFormat::Jxl => "image/jxl",
+        RealImageFormat::Qoi => "image/qoi",
     }
 }
 
 fn build_display_data_url(path: &Path) -> Option<String> {
     let bytes = fs::read(path).ok()?;
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .unwrap_or_default();
+    let detected_format = detect_real_image_format(path)?;
 
     // WebView2(Chromium) DOES NOT support TIFF/BMP natively.
-    // Convert them to PNG for display preview.
-    if matches!(ext.as_str(), "tif" | "tiff" | "bmp") {
-        // 1차 시도: 표준 디코드
-        let img = image::load_from_memory(&bytes).ok().or_else(|| {
-            // 2차 시도: FillOrder=2(LSB-first) TIFF 전용 패치 후 재시도
-            if matches!(ext.as_str(), "tif" | "tiff") {
-                try_fix_tiff_lsb_fill_order(&bytes)
-                    .and_then(|fixed| image::load_from_memory(&fixed).ok())
-            } else {
-                None
-            }
-        });
+    // Also handle extension-mismatch cases by checking real file signature.
+    if matches!(detected_format, RealImageFormat::Tiff | RealImageFormat::Bmp) {
+        let is_palette = matches!(detected_format, RealImageFormat::Tiff) && is_palette_tiff(&bytes);
+
+        // Palette TIFF는 image crate가 지원 안 하므로 바로 전용 디코더로
+        // max_size=1200: 인덱스 단계에서 다운샘플 → 풀 RGB 버퍼 생성 불필요
+        let img = if is_palette {
+            try_decode_palette_tiff_inner(&bytes, Some(1200))
+        } else {
+            // 1차 시도: 표준 디코드
+            image::load_from_memory(&bytes).ok().or_else(|| {
+                // 2차 시도: FillOrder=2(LSB-first) TIFF 전용 패치 후 재시도
+                if matches!(detected_format, RealImageFormat::Tiff) {
+                    try_fix_tiff_lsb_fill_order(&bytes)
+                        .and_then(|fixed| image::load_from_memory(&fixed).ok())
+                } else {
+                    None
+                }
+            }).or_else(|| {
+                // 3차 시도: Palette/Indexed color TIFF 폴백 (비Palette인데 표준 실패 시 최후 수단)
+                if matches!(detected_format, RealImageFormat::Tiff) {
+                    try_decode_palette_tiff(&bytes)
+                } else {
+                    None
+                }
+            })
+        };
         if let Some(img) = img {
             // Thumbnail for preview performance
             let preview = img.thumbnail(1200, 1200);
@@ -1365,7 +1635,7 @@ fn build_display_data_url(path: &Path) -> Option<String> {
     let encoded = BASE64_STANDARD.encode(bytes);
     Some(format!(
         "data:{};base64,{}",
-        guess_mime_from_path(path),
+        guess_mime_from_real_format(detected_format),
         encoded
     ))
 }

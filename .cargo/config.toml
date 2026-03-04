@@ -1,0 +1,4 @@
+[env]
+# cc crate v1.2.56 + rustc 1.93+ 조합에서 VS2022를 "VS 18 2026"으로 잘못 매핑하는 버그 우회.
+# cmake crate가 CMAKE_GENERATOR 환경변수를 우선적으로 사용하므로 올바른 VS17 generator를 강제한다.
+CMAKE_GENERATOR = "Visual Studio 17 2022"
