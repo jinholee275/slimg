@@ -17,6 +17,7 @@ type ImageDetails = {
   height: number | null;
   dpiX: number | null;
   dpiY: number | null;
+  format: string | null;
   color: string | null;
   error: string | null;
 };
@@ -294,6 +295,7 @@ function emptyDetails(loading = false): ImageDetailsState {
     height: null,
     dpiX: null,
     dpiY: null,
+    format: null,
     color: null,
     error: null,
     loading,
@@ -1770,21 +1772,22 @@ const avgPerFileText = computed(() => (avgPerFileSeconds.value == null ? '-' : f
                     {{ detailsMap[file.relativePath]?.loading ? '원본 로딩 중...' : '이미지를 표시할 수 없습니다.' }}
                   </div>
                   <div class="image-meta-float">
-                    <div>
-                      DPI:
-                      {{
-                        formatDpi(
-                          detailsMap[file.relativePath]?.dpiX ?? null,
-                          detailsMap[file.relativePath]?.dpiY ?? null,
-                        )
-                      }}
-                    </div>
+                    <div>포맷: {{ detailsMap[file.relativePath]?.format ?? '-' }}</div>
                     <div>
                       해상도:
                       {{
                         formatResolution(
                           detailsMap[file.relativePath]?.width ?? null,
                           detailsMap[file.relativePath]?.height ?? null,
+                        )
+                      }}
+                    </div>
+                    <div>
+                      DPI:
+                      {{
+                        formatDpi(
+                          detailsMap[file.relativePath]?.dpiX ?? null,
+                          detailsMap[file.relativePath]?.dpiY ?? null,
                         )
                       }}
                     </div>
@@ -1866,6 +1869,7 @@ const avgPerFileText = computed(() => (avgPerFileSeconds.value == null ? '-' : f
                   </div>
                   <div class="image-meta-float">
                     <template v-if="destDetailsMap[file.relativePath]">
+                      <div>포맷: {{ destDetailsMap[file.relativePath]?.format ?? '-' }}</div>
                       <div>
                         DPI:
                         {{

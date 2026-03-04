@@ -46,6 +46,7 @@ struct ImageDetails {
     height: Option<u32>,
     dpi_x: Option<f32>,
     dpi_y: Option<f32>,
+    format: Option<String>,
     color: Option<String>,
     error: Option<String>,
 }
@@ -1720,6 +1721,21 @@ fn guess_mime_from_real_format(format: RealImageFormat) -> &'static str {
     }
 }
 
+fn display_format_from_real_format(format: RealImageFormat) -> &'static str {
+    match format {
+        RealImageFormat::Jpeg => "JPEG",
+        RealImageFormat::Png => "PNG",
+        RealImageFormat::WebP => "WebP",
+        RealImageFormat::Avif => "AVIF",
+        RealImageFormat::HeicLike => "HEIC",
+        RealImageFormat::Jxl => "JXL",
+        RealImageFormat::Qoi => "QOI",
+        RealImageFormat::Tiff => "TIFF",
+        RealImageFormat::Bmp => "BMP",
+        RealImageFormat::Gif => "GIF",
+    }
+}
+
 fn build_display_data_url(path: &Path) -> Option<String> {
     let bytes = fs::read(path).ok()?;
     let detected_format = detect_real_image_format(path)?;
@@ -1997,6 +2013,9 @@ fn get_image_details_sync(path: String) -> Result<ImageDetails, String> {
 
     let (dpi_x, dpi_y) = read_exif_dpi(&file_path);
     let size_bytes = fs::metadata(&file_path).ok().map(|m| m.len());
+    let format = detect_real_image_format(&file_path)
+        .map(display_format_from_real_format)
+        .map(|v| v.to_string());
 
     let img = match load_image_with_fallback(&file_path) {
         Ok(img) => img,
@@ -2008,6 +2027,7 @@ fn get_image_details_sync(path: String) -> Result<ImageDetails, String> {
                 height: None,
                 dpi_x,
                 dpi_y,
+                format,
                 color: None,
                 error: Some(e),
             });
@@ -2028,6 +2048,7 @@ fn get_image_details_sync(path: String) -> Result<ImageDetails, String> {
         height: Some(height),
         dpi_x,
         dpi_y,
+        format,
         color,
         error: None,
     })
