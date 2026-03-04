@@ -3,6 +3,7 @@ import { ref, computed, onBeforeUnmount, onMounted, nextTick } from 'vue';
 import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import ImageMetaBoxContent from './components/ImageMetaBoxContent.vue';
 
 type FileItem = {
   relativePath: string;
@@ -1175,6 +1176,8 @@ function onViewerWheel(event: WheelEvent) {
 }
 
 const isCompareViewer = computed(() => !!viewerSourceImageUrl.value && !!viewerDestImageUrl.value);
+const viewerSourceMeta = computed(() => detailsMap.value[viewerTitle.value] ?? null);
+const viewerDestMeta = computed(() => destDetailsMap.value[viewerTitle.value] ?? null);
 function updateViewerSplitByClientX(clientX: number) {
   const el = viewerCanvasRef.value;
   if (!el) return;
@@ -1751,7 +1754,6 @@ const avgPerFileText = computed(() => (avgPerFileSeconds.value == null ? '-' : f
                   <div class="image-path path-copy-text path-main" :title="file.absolutePath" @click="copyWithFeedback(file.absolutePath, `src-${file.relativePath}`)">
                     {{ file.relativePath }}
                   </div>
-                  <div class="path-size">{{ formatBytes(file.sizeBytes) }}</div>
                 </div>
                 <div class="image-preview-wrap">
                   <img
@@ -1772,26 +1774,12 @@ const avgPerFileText = computed(() => (avgPerFileSeconds.value == null ? '-' : f
                     {{ detailsMap[file.relativePath]?.loading ? '원본 로딩 중...' : '이미지를 표시할 수 없습니다.' }}
                   </div>
                   <div class="image-meta-float">
-                    <div>포맷: {{ detailsMap[file.relativePath]?.format ?? '-' }}</div>
-                    <div>
-                      해상도:
-                      {{
-                        formatResolution(
-                          detailsMap[file.relativePath]?.width ?? null,
-                          detailsMap[file.relativePath]?.height ?? null,
-                        )
-                      }}
-                    </div>
-                    <div>
-                      DPI:
-                      {{
-                        formatDpi(
-                          detailsMap[file.relativePath]?.dpiX ?? null,
-                          detailsMap[file.relativePath]?.dpiY ?? null,
-                        )
-                      }}
-                    </div>
-                    <div>컬러: {{ detailsMap[file.relativePath]?.color ?? '-' }}</div>
+                    <ImageMetaBoxContent
+                      :details="detailsMap[file.relativePath]"
+                      :format-bytes="formatBytes"
+                      :format-resolution="formatResolution"
+                      :format-dpi="formatDpi"
+                    />
                   </div>
                 </div>
                 <div v-if="detailsMap[file.relativePath]?.error" class="card-error">
@@ -1832,13 +1820,6 @@ const avgPerFileText = computed(() => (avgPerFileSeconds.value == null ? '-' : f
 
               <div class="card-pane right-pane">
                 <div class="path-row dest-path-row">
-                  <div class="path-size">
-                    {{
-                      destDetailsMap[file.relativePath]?.sizeBytes != null
-                        ? formatBytes(destDetailsMap[file.relativePath]?.sizeBytes ?? 0)
-                        : '-'
-                    }}
-                  </div>
                   <div class="image-path path-copy-text path-main" :title="toDestAbsolutePath(file) ?? ''" @click="copyWithFeedback(toDestAbsolutePath(file), `dest-${file.relativePath}`)">
                     {{ file.relativePath }}
                   </div>
@@ -1867,32 +1848,15 @@ const avgPerFileText = computed(() => (avgPerFileSeconds.value == null ? '-' : f
                   <div v-else class="image-preview-placeholder">
                     동일 경로/이름 대상 파일 없음
                   </div>
-                  <div class="image-meta-float">
-                    <template v-if="destDetailsMap[file.relativePath]">
-                      <div>포맷: {{ destDetailsMap[file.relativePath]?.format ?? '-' }}</div>
-                      <div>
-                        DPI:
-                        {{
-                          formatDpi(
-                            destDetailsMap[file.relativePath]?.dpiX ?? null,
-                            destDetailsMap[file.relativePath]?.dpiY ?? null,
-                          )
-                        }}
-                      </div>
-                      <div>
-                        해상도:
-                        {{
-                          formatResolution(
-                            destDetailsMap[file.relativePath]?.width ?? null,
-                            destDetailsMap[file.relativePath]?.height ?? null,
-                          )
-                        }}
-                      </div>
-                      <div>컬러: {{ destDetailsMap[file.relativePath]?.color ?? '-' }}</div>
-                    </template>
-                    <template v-else>
-                      <div>상태: 미생성</div>
-                    </template>
+                  <div class="image-meta-float image-meta-float-left">
+                    <ImageMetaBoxContent
+                      :details="destDetailsMap[file.relativePath]"
+                      :format-bytes="formatBytes"
+                      :format-resolution="formatResolution"
+                      :format-dpi="formatDpi"
+                      :show-missing="true"
+                      missing-label="상태: 미생성"
+                    />
                   </div>
                 </div>
                 <div v-if="destDetailsMap[file.relativePath]?.error" class="card-error">
@@ -1970,6 +1934,22 @@ const avgPerFileText = computed(() => (avgPerFileSeconds.value == null ? '-' : f
             </div>
             <div class="compare-label compare-label-left">원본</div>
             <div class="compare-label compare-label-right">최적화</div>
+            <div class="viewer-meta-box viewer-meta-box-left" v-if="viewerSourceMeta">
+              <ImageMetaBoxContent
+                :details="viewerSourceMeta"
+                :format-bytes="formatBytes"
+                :format-resolution="formatResolution"
+                :format-dpi="formatDpi"
+              />
+            </div>
+            <div class="viewer-meta-box viewer-meta-box-right" v-if="viewerDestMeta">
+              <ImageMetaBoxContent
+                :details="viewerDestMeta"
+                :format-bytes="formatBytes"
+                :format-resolution="formatResolution"
+                :format-dpi="formatDpi"
+              />
+            </div>
           </template>
           <img
             v-else-if="viewerImageUrl"
@@ -2715,6 +2695,11 @@ body,
   backdrop-filter: blur(2px);
 }
 
+.image-meta-float-left {
+  left: 8px;
+  right: auto;
+}
+
 .card-error {
   margin-top: 6px;
   color: #f08c8c;
@@ -2868,6 +2853,29 @@ body,
 
 .compare-label-right {
   right: 10px;
+}
+
+.viewer-meta-box {
+  position: absolute;
+  bottom: 12px;
+  z-index: 2;
+  background: rgba(0, 0, 0, 0.68);
+  color: #f1f1f1;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.4;
+  padding: 6px 8px;
+  backdrop-filter: blur(2px);
+  pointer-events: none;
+}
+
+.viewer-meta-box-left {
+  left: 12px;
+}
+
+.viewer-meta-box-right {
+  right: 12px;
 }
 
 .virtual-spacer {
